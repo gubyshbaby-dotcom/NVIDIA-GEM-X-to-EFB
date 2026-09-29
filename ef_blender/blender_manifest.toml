@@ -1,0 +1,37 @@
+schema_version = "1.0.0"
+
+id = "ef_blender"
+version = "0.24.0"
+name = "Epic Fight / VIX"
+tagline = "Epic Fight rigs and animations, VIX camera shots"
+maintainer = "epic-port"
+type = "add-on"
+
+website = "https://github.com/rongus760-ship-it/epic-port"
+tags = ["Animation", "Rigging", "Import-Export"]
+
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+files = "Read Epic Fight jars, write animation and camera json"
+
+[build]
+# efb/data is the bundled biped: two armature/mesh jsons and the two default skins.
+# It must ship, or Generate has no body and no texture.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "/tests/",
+  "/out/",
+  "/dist/",
+  "/.scratch/",
+  "/gate.py",
+  "/anim_gate.py",
+  "/run_gates.py",
+  "/pack.py",
+  "/.gitignore",
+  "*.blend",
+  "*.blend1",
+  "*.zip",
+]
