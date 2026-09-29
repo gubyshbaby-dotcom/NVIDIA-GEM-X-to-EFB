@@ -26,8 +26,9 @@ from efb import bundled  # noqa: E402
 from efb import quat as Q  # noqa: E402
 from efb.animjson import dumps, loads  # noqa: E402
 from efb.clip import pose_table_from_clip, read_document  # noqa: E402
-from efb.gemx import (ROOT_IN_PLACE, SOMA_TO_EF, RetargetOptions,  # noqa: E402
-                      check_armature, retarget)
+from efb.gemx import (KEYS_PER_BONE, KEYS_SHARED, LOC_PER_DEGREE,  # noqa: E402
+                      ROOT_IN_PLACE, SOMA_TO_EF, RetargetOptions, check_armature,
+                      retarget)
 from efb.rig import Rig  # noqa: E402
 from efb.soma import (SomaError, SomaSkeleton, load_motion,  # noqa: E402
                       motion_from_bvh, motion_from_params)
@@ -252,6 +253,39 @@ class TestRetarget(unittest.TestCase):
         arm.joints.pop("Tool_R")
         with self.assertRaises(SomaError):
             check_armature(arm)
+
+
+class TestKeyReduction(unittest.TestCase):
+    """The json that goes straight to the game: Epic Fight lerps and nlerps between keys,
+    so the check is Track.sample, the port of its own interpolation."""
+
+    def check(self, mode, tol):
+        motion = load_motion(FIXTURE, fps=30.0)
+        dense, _ = retarget(motion, ARM, RetargetOptions(markers=True))
+        thin, rep = retarget(motion, ARM, RetargetOptions(markers=True, keys=mode,
+                                                          key_tolerance=tol))
+        self.assertLess(rep.keys_kept, rep.keys_dense)
+        worst_rot = worst_loc = 0.0
+        for full in dense.tracks:
+            kept = thin.track(full.name)
+            self.assertEqual(kept.times[0], full.times[0])
+            self.assertEqual(kept.times[-1], full.times[-1])
+            for time, key in zip(full.times, full.keys):
+                loc, rot, _scale = kept.sample(time).decompose()
+                worst_rot = max(worst_rot, math.degrees(Q.angle(rot, key.rot)))
+                worst_loc = max(worst_loc, max(abs(a - b) for a, b in zip(loc, key.loc)))
+        self.assertLessEqual(worst_rot, tol + 1e-3)
+        self.assertLessEqual(worst_loc, tol * LOC_PER_DEGREE)
+        return thin, rep
+
+    def test_per_bone_replays_inside_tolerance(self):
+        thin, rep = self.check(KEYS_PER_BONE, 0.5)
+        self.assertGreater(len({tuple(t.times) for t in thin.tracks}), 1)
+
+    def test_shared_keys_line_up(self):
+        thin, rep = self.check(KEYS_SHARED, 1.0)
+        self.assertEqual(len({tuple(t.times) for t in thin.tracks}), 1)
+        self.assertEqual(rep.key_frames, len(thin.tracks[0]))
 
 
 class TestBvh(unittest.TestCase):

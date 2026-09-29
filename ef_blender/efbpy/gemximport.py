@@ -10,6 +10,11 @@ handles are baked off it so any limb can be flipped to IK and worked on.
 The keys are an Epic Fight clip from the start, so File > Export > Epic Fight Animation
 writes it for the game with nothing further to do.
 
+The capture is a key per frame, which nobody can edit, so by default the FK keys are then
+rebuilt by efbpy.keyposes as a few keys per bone on smooth curves, inside a tolerance in
+degrees; "Key poses" puts every bone's keys on the same frames instead, and "Every frame"
+leaves the capture as it came.
+
 One thing a video does that a shipped clip does not: go past the rig's joint stops. The
 Epic Fight preset is exactly the envelope of the mod's own clips, and a person folds an
 elbow past 140 degrees or turns their head further than any of them. The game has no
@@ -17,8 +22,8 @@ stops, and the exporter reads the posed deform bones, so a stop left on would qu
 rewrite the capture. The import therefore measures, on the live rig, whether any stop
 holds a bone off the clip, and if one does it switches the rig's Joint Limits off and says
 so - the same stance the Epic Fight import takes with Replay. "Keep joint limits" clamps on
-purpose instead. The IK bake runs after that decision, so the handles sit on the pose the
-rig actually plays.
+purpose instead. The limits are measured on the dense keys, and the IK bake runs after the
+keys are reduced, so the handles sit on the pose the rig actually plays.
 """
 
 import json
@@ -34,6 +39,7 @@ from efb.gemx import ROOT_FULL, ROOT_IN_PLACE, RetargetOptions, check_armature, 
 from efb.rig import COORD_BONE, Rig
 from efb.soma import DEFAULT_FPS, SomaError, load_motion
 
+from . import keyposes
 from .animops import _armature, _rig_armature, _spawn_entity, _do_import, existing_rig
 from .ops import BUILDS
 
@@ -137,6 +143,12 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
     clavicle: FloatProperty(
         name="Collarbones", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
         description="How much of the collarbones' motion the shoulders take")
+    keys: EnumProperty(name="Keys", items=keyposes.MODES, default=keyposes.DEFAULT_MODE,
+                       description="How the clip is keyed on the rig")
+    key_tolerance: FloatProperty(
+        name="Key tolerance", default=keyposes.DEFAULT_DEGREES, min=0.1, max=20.0,
+        description="How far, in degrees, a bone may stray from the capture between keys. "
+                    "Larger means fewer keys")
     keep_limits: BoolProperty(
         name="Keep joint limits", default=False,
         description="Let the rig's joint stops clamp the capture where it goes past "
@@ -165,6 +177,7 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                             "smoothing"), False),
                 ("Placement", ("root_motion", "face_forward", "start_at_origin", "ground",
                                "subject_height"), False),
+                ("Keys", ("keys", "key_tolerance"), False),
                 ("Body", ("hinge", "tools", "clavicle", "keep_limits"), False),
                 ("Rig", ("variant", "body_mesh", "bake_ik"), False),
                 ("Armature source (optional)", ("entity", "armature_file", "jar"), True)):
@@ -215,6 +228,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
             return result
         rig = context.view_layer.objects.active
         limits_off = self._settle_limits(context, rig, armature, doc, info.fps_out)
+        keys = keyposes.reduce_keys(rig, degrees=self.key_tolerance, mode=self.keys,
+                                    frame_range=(0, info.frames_out - 1))
         baked = self._bake(context, rig, info.frames_out) if self.bake_ik else 0
         action = rig.animation_data.action if rig and rig.animation_data else None
         if action is not None:
@@ -223,8 +238,12 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                 "fps": info.fps_out, "subject_height": round(info.subject_height, 4),
                 "estimated": info.height_estimated, "leg_scale": round(info.leg_scale, 5),
                 "options": vars(self.retarget_options()), "notes": info.notes,
-                "limits_switched_off": limits_off})
+                "limits_switched_off": limits_off, "keys": self.keys,
+                "key_tolerance": self.key_tolerance})
         extra = list(info.notes[-2:])
+        if keys[0]:
+            extra.append("%d keys -> %d%s" % (keys[0], keys[1], " on %d key poses"
+                                                % keys[2] if keys[2] else ""))
         if baked:
             extra.append("IK baked on %d limbs" % baked)
         if limits_off:

@@ -46,13 +46,15 @@ from . import quat as Q
 from .animjson import ATTRIBUTES, AnimationDocument, TRS, Track
 from .armature import Armature
 from .clip import EF_TIME_DECIMALS, EF_VALUE_DECIMALS, quantize_trs, time_from_frame
+from .keyfit import fit_indices
 from .rigdef import LENGTHS
 from .rigedit import SEAMS, seam_slide
 from .soma import SomaError, SomaMotion, SomaSkeleton, load_motion
 
 __all__ = ["RetargetOptions", "RetargetReport", "retarget", "convert_file",
            "SOMA_TO_EF", "BODY_SOURCES", "LIMBS", "ROOT_FULL", "ROOT_IN_PLACE",
-           "HINGE_FADE", "required_joints", "check_armature", "SomaError"]
+           "HINGE_FADE", "required_joints", "check_armature", "SomaError",
+           "KEYS_ALL", "KEYS_SHARED", "KEYS_PER_BONE", "reduce_tracks"]
 
 SOMA_TO_EF = Q.from_rows(((-1.0, 0.0, 0.0),
                           (0.0, 0.0, 1.0),
@@ -60,6 +62,12 @@ SOMA_TO_EF = Q.from_rows(((-1.0, 0.0, 0.0),
 
 ROOT_FULL = "FULL"
 ROOT_IN_PLACE = "IN_PLACE"
+
+KEYS_ALL = "ALL"
+KEYS_SHARED = "SHARED"
+KEYS_PER_BONE = "PER_BONE"
+
+LOC_PER_DEGREE = 0.005
 
 HINGE_FADE = (8.0, 20.0)
 
@@ -126,6 +134,14 @@ class RetargetOptions:
     markers         write Elbow_* / Knee_* seam tracks - for a json going straight into
                     the game; the Blender rig slides them itself
     static_tracks   write rest tracks for joints nothing drives, as shipped clips do
+    keys            ALL keeps a key on every frame; PER_BONE lets each track keep only
+                    the keys a straight line between its neighbours cannot recreate, which
+                    is what the game replays exactly; SHARED keeps the same frames on every
+                    track. The Blender import keys every frame and fits smooth curves itself
+                    (efbpy.keyposes); this is for a json going straight to the game
+    key_tolerance   how far, in degrees, the reduced clip may stray from the capture
+                    between keys (the Root and the markers get LOC_PER_DEGREE metres per
+                    degree). A bound, not an average: every dropped frame is inside it
     """
     fps: float = 0.0
     start: int = 0
@@ -142,6 +158,8 @@ class RetargetOptions:
     clavicle: float = 1.0
     markers: bool = False
     static_tracks: bool = False
+    keys: str = KEYS_ALL
+    key_tolerance: float = 0.5
 
 
 @dataclass
@@ -158,6 +176,9 @@ class RetargetReport:
     floor_offset: float = 0.0
     turned_degrees: float = 0.0
     hinge_error_degrees: float = 0.0
+    keys_dense: int = 0
+    keys_kept: int = 0
+    key_frames: int = 0
     notes: list = field(default_factory=list)
 
     @property
@@ -165,9 +186,14 @@ class RetargetReport:
         return (self.frames_out - 1) / self.fps_out if self.fps_out and self.frames_out else 0.0
 
     def summary(self) -> str:
-        return ("%d frames at %g fps (%.2f s), subject %.2f m%s, legs x%.3f"
-                % (self.frames_out, self.fps_out, self.duration, self.subject_height,
-                   " (estimated)" if self.height_estimated else "", self.leg_scale))
+        out = ("%d frames at %g fps (%.2f s), subject %.2f m%s, legs x%.3f"
+               % (self.frames_out, self.fps_out, self.duration, self.subject_height,
+                  " (estimated)" if self.height_estimated else "", self.leg_scale))
+        if self.keys_kept and self.keys_kept < self.keys_dense:
+            out += ", %d of %d keys kept" % (self.keys_kept, self.keys_dense)
+            if self.key_frames:
+                out += " on %d key poses" % self.key_frames
+        return out
 
 
 def required_joints():
@@ -603,6 +629,9 @@ def retarget(motion: SomaMotion, armature: Armature, options=None):
     report.hinge_error_degrees = solver.hinge_error
 
     doc = _document(armature, rest, worlds, roots, motion.fps, opts)
+    report.keys_dense = sum(len(t) for t in doc.tracks)
+    doc.tracks, report.key_frames = reduce_tracks(doc.tracks, opts.keys, opts.key_tolerance)
+    report.keys_kept = sum(len(t) for t in doc.tracks)
     return doc, report
 
 
@@ -636,6 +665,51 @@ def _document(armature, rest, worlds, roots, fps, opts):
             keys.append(quantize_trs(TRS(trs.loc, q, trs.sca), EF_VALUE_DECIMALS))
         tracks.append(Track(name, [times[i] for i in keep], keys, ATTRIBUTES))
     return AnimationDocument(tracks, None, ATTRIBUTES, {}, ("format", "animation"))
+
+
+def _key_rows(track, tol_deg):
+    """One row per key, each channel divided by its own tolerance so that 1.0 is the bound
+    everywhere. A quaternion component within theta/4 of the line keeps the whole rotation
+    within theta; a location within its bound over each axis stays within it."""
+    rot = math.radians(tol_deg) / 4.0
+    loc = tol_deg * LOC_PER_DEGREE / 2.0
+    moves = any(any(abs(v) > 1e-9 for v in k.loc) for k in track.keys)
+    rows = []
+    for k in track.keys:
+        row = [v / rot for v in k.rot]
+        if moves:
+            row += [v / loc for v in k.loc]
+        rows.append(row)
+    return rows
+
+
+def reduce_tracks(tracks, mode=KEYS_SHARED, tol_deg=1.0):
+    """(tracks, shared key count) with only the keys linear interpolation cannot recreate.
+
+    Both Blender's LINEAR curves and Epic Fight's lerp / nlerp draw straight lines between
+    keys, so a dropped key costs exactly its distance from the line its neighbours draw -
+    which is what efb.keyfit bounds. SHARED fits the whole body at once and keeps one set of
+    frames for every track; PER_BONE fits each track alone. The ends always stay, so every
+    track keeps at least two keys, as every shipped one has.
+    """
+    if mode == KEYS_ALL or tol_deg <= 0.0 or not tracks:
+        return tracks, 0
+    if mode == KEYS_SHARED:
+        times = tracks[0].times
+        if any(t.times != times for t in tracks):
+            mode = KEYS_PER_BONE
+        else:
+            per = [_key_rows(t, tol_deg) for t in tracks]
+            rows = [[v for p in per for v in p[i]] for i in range(len(times))]
+            keep = fit_indices(times, rows, 1.0)
+            return [Track(t.name, [t.times[i] for i in keep], [t.keys[i] for i in keep],
+                          t.format) for t in tracks], len(keep)
+    out = []
+    for t in tracks:
+        keep = fit_indices(t.times, _key_rows(t, tol_deg), 1.0)
+        out.append(Track(t.name, [t.times[i] for i in keep], [t.keys[i] for i in keep],
+                         t.format))
+    return out, 0
 
 
 def _local(rest, world, name):

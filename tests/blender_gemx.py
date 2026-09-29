@@ -5,7 +5,10 @@
 
 Checks that the operator spawns the rig, keys the clip, leaves every limb on FK with the
 IK handles baked, and that the deform bones Blender evaluates are the pose the retarget
-wrote - the same comparison the Epic Fight export makes - to 1e-4. With --render it also
+wrote - the same comparison the Epic Fight export makes - to 1e-4. Then that the default
+key reduction stays inside its tolerance on every frame and that "Key poses" lines every
+bone up; and that switching the rig wide -> slim lands on exactly the rig Generate makes
+for slim, keeps every key and every pose delta, and switches back. With --render it also
 writes workbench PNGs of the listed frames.
 """
 
@@ -53,7 +56,7 @@ def main():
     for o in list(bpy.data.objects):
         bpy.data.objects.remove(o)
 
-    res = bpy.ops.efb.import_gemx(filepath=a["path"])
+    res = bpy.ops.efb.import_gemx(filepath=a["path"], keys="ALL")
     if res != {"FINISHED"}:
         fail("operator returned %s" % res)
     rig = bpy.context.view_layer.objects.active
@@ -117,6 +120,8 @@ def main():
 
     ik_flip_holds(rig, table)
     export_matches(a["path"], arm)
+    keys_hold(a["path"], arm)
+    switch_holds(a["path"])
 
     if a["render"]:
         render(rig, a["render"], [int(table.frames[f]) for f in frames])
@@ -147,6 +152,145 @@ def ik_flip_holds(rig, table):
     print("IK flip moves a limb tip by at most %.4f m (%s)" % (worst, where))
     if worst > 0.01:
         fail("switching to IK moves the pose %.3f m at %s" % (worst, where))
+
+
+def _fresh():
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    for act in list(bpy.data.actions):
+        bpy.data.actions.remove(act)
+
+
+def keys_hold(path, arm):
+    """Default import (per bone, 2 degrees): every FK control within 2 degrees of the
+    capture on every frame, the Root within its travel bound; then "Key poses" keys every
+    bone on the same frames."""
+    from efb import quat as Q
+    from efbpy.animscene import action_curves, fk_controls
+    from efbpy.keyposes import LOC_PER_DEGREE
+
+    dense, info = retarget(load_motion(path, fps=30.0), arm, RetargetOptions())
+    for mode in ("PER_BONE", "SHARED"):
+        _fresh()
+        if bpy.ops.efb.import_gemx(filepath=path, keys=mode, key_tolerance=2.0) \
+                != {"FINISHED"}:
+            fail("import with keys=%s failed" % mode)
+        rig = bpy.context.view_layer.objects.active
+        action = rig.animation_data.action
+        ctrl = fk_controls(rig)
+        curves = {}
+        for fc in action_curves(action, rig):
+            curves[(fc.data_path, fc.array_index)] = fc
+        worst_rot = worst_loc = 0.0
+        frames_of = set()
+        total = 0
+        for track in dense.tracks:
+            name = ctrl.get(track.name, track.name)
+            base = 'pose.bones["%s"].' % name
+            quat = [curves.get((base + "rotation_quaternion", i)) for i in range(4)]
+            if None in quat:
+                continue
+            frames_of.add(tuple(round(k.co[0], 3) for k in quat[1].keyframe_points))
+            total += sum(len(fc.keyframe_points) for fc in quat)
+            loc = [curves.get((base + "location", i)) for i in range(3)]
+            for f, key in enumerate(track.keys):
+                got = tuple(fc.evaluate(f) for fc in quat)
+                worst_rot = max(worst_rot, math.degrees(Q.angle(got, key.rot)))
+                if track.name == "Root" and None not in loc:
+                    worst_loc = max(worst_loc, max(abs(fc.evaluate(f) - v)
+                                                   for fc, v in zip(loc, key.loc)))
+        print("keys=%s: %d rotation keys over %d frames, worst %.3f deg, root %.4f m, "
+              "%d distinct key-frame sets" % (mode, total, info.frames_out, worst_rot,
+                                               worst_loc, len(frames_of)))
+        if worst_rot > 2.0 + 1e-3 or worst_loc > 2.0 * LOC_PER_DEGREE:
+            fail("keys=%s strays past its tolerance" % mode)
+        if mode == "SHARED" and len(frames_of) != 1:
+            fail("key poses do not line the bones up")
+
+
+def switch_holds(path):
+    """Wide rig with a clip -> Slim -> Wide. The slim result is compared against a fresh
+    Generate of slim, bone by bone, and the clip against itself."""
+    from efbpy.animscene import action_curves, local_delta
+    from efbpy.body import bodies_of
+
+    _fresh()
+    bpy.ops.efb.import_gemx(filepath=path, keys="PER_BONE", variant="biped")
+    rig = bpy.context.view_layer.objects.active
+    action = rig.animation_data.action
+    keys = {(fc.data_path, fc.array_index): [tuple(k.co) for k in fc.keyframe_points]
+            for fc in action_curves(action, rig) if "IK-" not in fc.data_path
+            and "POLE-" not in fc.data_path and ".ik" not in fc.data_path
+            and ".twist" not in fc.data_path}
+    scene = bpy.context.scene
+    probe = [0, scene.frame_end // 2, scene.frame_end]
+    deform = [b.name for b in rig.data.bones if b.use_deform
+              and not b.name.startswith(("Knee", "Elbow"))]
+
+    def deltas():
+        out = {}
+        for f in probe:
+            scene.frame_set(f)
+            for n in deform:
+                out[(n, f)] = local_delta(rig.pose.bones[n])
+        return out
+
+    before = deltas()
+    wide_rest = {b.name: b.matrix_local.copy() for b in rig.data.bones}
+    if bpy.ops.efb.switch_build(variant="biped_slim_arm", rig=rig.name) != {"FINISHED"}:
+        fail("switch to slim failed")
+    rig = bpy.data.objects[rig.name] if rig.name in bpy.data.objects else \
+        next(o for o in bpy.data.objects if o.type == "ARMATURE")
+
+    scene.collection.children.link(bpy.data.collections.new("fresh"))
+    active = bpy.context.view_layer.objects.active
+    bpy.ops.efb.generate_rig(variant="biped_slim_arm", body_mesh=False)
+    fresh = bpy.context.view_layer.objects.active
+    worst = max(max(abs(a - b) for ra, rb in zip(rig.data.bones[n].matrix_local,
+                                                   fresh.data.bones[n].matrix_local)
+                    for a, b in zip(ra, rb)) for n in fresh.data.bones.keys())
+    seat = 0.0
+    for pb in rig.pose.bones:
+        for c in pb.constraints:
+            if c.type == "CHILD_OF":
+                want = fresh.pose.bones[pb.name].constraints[c.name].inverse_matrix
+                seat = max(seat, max(abs(a - b) for ra, rb in zip(c.inverse_matrix, want)
+                                     for a, b in zip(ra, rb)))
+    bpy.data.objects.remove(fresh)
+    bpy.context.view_layer.objects.active = rig = active
+    print("switch: rests vs fresh slim %.2e, Child Of inverses %.2e" % (worst, seat))
+    if worst > 1e-5 or seat > 1e-5:
+        fail("the switched rig is not the slim rig")
+
+    now = {(fc.data_path, fc.array_index): [tuple(k.co) for k in fc.keyframe_points]
+           for fc in action_curves(rig.animation_data.action, rig)
+           if (fc.data_path, fc.array_index) in keys}
+    if now != keys:
+        fail("switching moved FK keys")
+    after = deltas()
+    drift = max(max(abs(a - b) for ra, rb in zip(before[k], after[k]) for a, b in zip(ra, rb))
+                for k in before)
+    bodies = bodies_of(rig)
+    print("switch: pose deltas moved %.2e, bodies %s" % (drift, [
+        (o.name, o.get("efb_body"), len(o.data.vertices)) for o in bodies]))
+    if drift > 1e-5:
+        fail("switching changed the pose deltas")
+    if not bodies or bodies[0].get("efb_body") != "biped_slim_arm":
+        fail("the body was not swapped")
+
+    table_frames = list(range(scene.frame_end + 1))
+
+    class _T:
+        frames = table_frames
+
+    ik_flip_holds(rig, _T)
+
+    bpy.ops.efb.switch_build(variant="biped", rig=rig.name)
+    back = max(max(abs(a - b) for ra, rb in zip(rig.data.bones[n].matrix_local, wide_rest[n])
+                   for a, b in zip(ra, rb)) for n in wide_rest)
+    print("switch back: rests vs the original wide %.2e" % back)
+    if back > 1e-5:
+        fail("slim -> wide does not come back")
 
 
 def export_matches(path, arm):

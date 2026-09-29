@@ -266,6 +266,8 @@ class EFB_PT_body(_RigPanel):
             if prop in obj:
                 row.prop(obj, '["%s"]' % prop, text=label, toggle=True, icon=icon)
 
+        from .buildswitch import draw_build_switch
+        draw_build_switch(layout, obj)
         _body_switch(layout, obj)
         _skin(layout, obj)
         _tool_bind(layout, obj)
@@ -673,6 +675,7 @@ class EFB_PT_build(bpy.types.Panel):
         col.operator_menu_enum("efb.generate_rig", "variant", icon="ARMATURE_DATA")
         col.operator("efb.import_animation", text="Import Animation", icon="IMPORT")
         col.operator("efb.import_gemx", text="Import GEM-X Motion", icon="ARMATURE_DATA")
+        col.operator("efb.reduce_keys", text="Reduce Keys", icon="IPO_BEZIER")
 
 
 CLASSES = (EFB_PT_rig, EFB_PT_arms, EFB_PT_legs, EFB_PT_body, EFB_PT_visibility,

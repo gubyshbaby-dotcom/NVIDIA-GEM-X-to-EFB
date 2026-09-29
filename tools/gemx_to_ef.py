@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.p
 from efb import bundled  # noqa: E402
 from efb.animjson import save  # noqa: E402
 from efb.armature import Armature  # noqa: E402
-from efb.gemx import ROOT_FULL, ROOT_IN_PLACE, RetargetOptions, retarget  # noqa: E402
+from efb.gemx import (KEYS_ALL, KEYS_PER_BONE, KEYS_SHARED, ROOT_FULL,  # noqa: E402
+                      ROOT_IN_PLACE, RetargetOptions, retarget)
 from efb.soma import SomaError, describe, load_motion  # noqa: E402
 
 
@@ -61,6 +62,12 @@ def parse(argv=None):
                    help="leave Tool_R / Tool_L at rest in the hand")
     p.add_argument("--clavicle", type=float, default=1.0,
                    help="share of the collarbones' motion the shoulders take, 0..1")
+    p.add_argument("--keys", choices=("per-bone", "shared", "all"), default="per-bone",
+                   help="per-bone (default) keeps on each track only the keys Epic Fight's "
+                        "own lerp cannot recreate; shared keeps the same frames on every "
+                        "track; all keeps every frame")
+    p.add_argument("--key-tolerance", type=float, default=0.5,
+                   help="degrees a joint may stray between kept keys (default 0.5)")
     p.add_argument("--slim", action="store_true", help="the slim-armed (Alex) biped")
     p.add_argument("--armature", help="an Epic Fight armature json to retarget onto "
                                       "instead of the bundled biped")
@@ -92,7 +99,9 @@ def main(argv=None):
         root_motion=ROOT_IN_PLACE if a.in_place else ROOT_FULL,
         face_forward=not a.keep_facing, start_at_origin=not a.keep_origin,
         ground=not a.no_ground, subject_height=a.height, hinge=not a.no_hinge,
-        tools=not a.no_tools, clavicle=a.clavicle, markers=True, static_tracks=True)
+        tools=not a.no_tools, clavicle=a.clavicle, markers=True, static_tracks=True,
+        keys={"per-bone": KEYS_PER_BONE, "shared": KEYS_SHARED, "all": KEYS_ALL}[a.keys],
+        key_tolerance=a.key_tolerance)
     try:
         motion = load_motion(a.input, fps=a.fps_in)
         doc, info = retarget(motion, armature, opts)
