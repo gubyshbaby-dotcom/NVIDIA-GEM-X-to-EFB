@@ -672,6 +672,7 @@ class EFB_PT_build(bpy.types.Panel):
         col = self.layout.column(align=True)
         col.operator_menu_enum("efb.generate_rig", "variant", icon="ARMATURE_DATA")
         col.operator("efb.import_animation", text="Import Animation", icon="IMPORT")
+        col.operator("efb.import_gemx", text="Import GEM-X Motion", icon="ARMATURE_DATA")
 
 
 CLASSES = (EFB_PT_rig, EFB_PT_arms, EFB_PT_legs, EFB_PT_body, EFB_PT_visibility,

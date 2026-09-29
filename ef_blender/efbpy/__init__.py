@@ -16,6 +16,7 @@
   efbpy.ikbake      the IK handles put on an imported clip's FK result
   efbpy.animexport  action -> Epic Fight animation json
   efbpy.animops     import/export operators and their File menu entries
+  efbpy.gemximport  NVIDIA GEM-X / SOMA video mocap -> an Epic Fight clip on the rig
   efbpy.migrate     carrying an action forward from an older rig
   efbpy.rootcarry   handing an older rig's loose handles and poles to the root, in place
   efbpy.camexport   Blender cameras -> VIX camera animations plus a shot manifest
@@ -30,11 +31,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from . import (animops, camexport, migrate, mirror, ops, restpose,
+from . import (animops, camexport, gemximport, migrate, mirror, ops, restpose,
                rigedit, rootcarry, spaces, tool, toolproxy, ui)
 
 _MODULES = (ops, spaces, restpose, mirror, rigedit, tool, toolproxy, ui, animops,
-            migrate, rootcarry, camexport)
+            gemximport, migrate, rootcarry, camexport)
 
 
 def register():

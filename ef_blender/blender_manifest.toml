@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "ef_blender"
-version = "0.24.0"
+version = "0.25.0"
 name = "Epic Fight / VIX"
-tagline = "Epic Fight rigs and animations, VIX camera shots"
+tagline = "Epic Fight rigs and animations, GEM-X mocap, VIX camera shots"
 maintainer = "epic-port"
 type = "add-on"
 
@@ -14,7 +14,7 @@ blender_version_min = "4.2.0"
 license = ["SPDX:MIT"]
 
 [permissions]
-files = "Read Epic Fight jars, write animation and camera json"
+files = "Read Epic Fight jars and GEM-X results, write animation json"
 
 [build]
 # efb/data is the bundled biped: two armature/mesh jsons and the two default skins.

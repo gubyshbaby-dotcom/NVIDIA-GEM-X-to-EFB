@@ -13,6 +13,10 @@ writes files; that keeps the whole test suite runnable in plain python3.
   efb.vixcam      VIX camera json read/write and its sampler
   efb.jarsource   read all of the above straight out of the mod jar
   efb.openmatrix  verbatim port of Epic Fight's own matrix math, test oracle only
+  efb.tensorio    torch.save / numpy files read without torch, numpy or pickle's trust
+  efb.quat        tuple quaternions for the retarget
+  efb.soma        NVIDIA SOMA: the skeleton GEM-X solves for and the motion it returns
+  efb.gemx        SOMA motion -> an Epic Fight animation document for the biped
 """
 
 from .matrix import Mat4
