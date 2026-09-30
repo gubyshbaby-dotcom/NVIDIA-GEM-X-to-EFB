@@ -32,6 +32,13 @@ wrist's real orientation, pronation included, goes to the Tool socket instead, w
 where the weapon sits. Near a straight limb the plane is noise, so the correction fades out
 below HINGE_FADE degrees of bend and the copied twist stands.
 
+Reaching arms are straightened. A single camera reads depth worst of anything, and a
+punch shows it: the arm is straight in the video while the estimate tips the forearm
+towards or away from the lens, folding its length into the elbow. With GEM-X's camera-space
+copy of the body at hand, a raised arm's forearm keeps the direction it has on screen and
+takes the depth that bends it least (see _Solver._depth); then any bend left under
+EXTEND_BELOW degrees is opened further (see _extend).
+
 The Hips' track is scaled by leg length - the biped's legs are 0.761 m, a person's about
 0.93 - so stride and jump height fit the body that has to perform them, and the result is
 dropped onto the floor through the biped's own feet.
@@ -125,8 +132,9 @@ class RetargetOptions:
 
     fps             output rate; 0 keeps the source's, capped at MAX_AUTO_FPS
     start, end      source frames to use, inclusive; end -1 is the last
-    smoothing       gaussian sigma in source frames, 0 off. GEM-X regresses a whole clip
-                    at once and is steady; a little takes the last shimmer off hands
+    smoothing       gaussian sigma in source frames, 0 off (the default). GEM-X regresses
+                    a whole clip at once and is already steady; a filter shaves the peaks
+                    off fast moves - a 24 fps punch lasts two or three frames
     root_motion     FULL keeps the path, IN_PLACE keeps only the height
     face_forward    turn the clip so its first frame faces the rig's front
     start_at_origin slide it so its first frame stands on the rig's origin
@@ -145,6 +153,11 @@ class RetargetOptions:
                     it. The biped's arm roots are 2.3 times as far apart as a person's,
                     so copied angles turn hands held at the chest into elbows jabbed out
                     at the sides
+    extend          0..1, how far to straighten a reaching arm - one raised REACH_RAISE
+                    degrees or more from the torso, as in a punch; a hanging or swinging
+                    arm is left alone. With the camera-space body (incam) the forearm's
+                    depth is re-chosen as the straightest the video allows (_depth), and
+                    an elbow still bent under EXTEND_BELOW degrees is opened (_extend)
     markers         write Elbow_* / Knee_* seam tracks - for a json going straight into
                     the game; the Blender rig slides them itself
     static_tracks   write rest tracks for joints nothing drives, as shipped clips do
@@ -160,7 +173,7 @@ class RetargetOptions:
     fps: float = 0.0
     start: int = 0
     end: int = -1
-    smoothing: float = 1.0
+    smoothing: float = 0.0
     root_motion: str = ROOT_FULL
     face_forward: bool = True
     start_at_origin: bool = True
@@ -171,6 +184,7 @@ class RetargetOptions:
     tools: bool = True
     clavicle: float = 0.4
     hands: float = 1.0
+    extend: float = 1.0
     markers: bool = False
     static_tracks: bool = False
     keys: str = KEYS_ALL
@@ -213,6 +227,7 @@ class RetargetReport:
     floor_offset: float = 0.0
     turned_degrees: float = 0.0
     hinge_error_degrees: float = 0.0
+    arms_straightened: int = 0
     keys_dense: int = 0
     keys_kept: int = 0
     key_frames: int = 0
@@ -231,6 +246,8 @@ class RetargetReport:
             out += ", %d of %d keys kept" % (self.keys_kept, self.keys_dense)
             if self.key_frames:
                 out += " on %d key poses" % self.key_frames
+        if self.arms_straightened:
+            out += ", %d reaching arm frames straightened" % self.arms_straightened
         return out
 
 
@@ -508,6 +525,42 @@ class _BodyMap:
 
 SOFT_REACH = 0.08
 
+EXTEND_BELOW = 90.0
+
+REACH_RAISE = (45.0, 70.0)
+
+DEPTH_BEND = (60.0, 100.0)
+
+DEPTH_REPORT = 5.0
+
+
+def _ramp(value, lo, hi):
+    t = min(1.0, max(0.0, (value - lo) / (hi - lo)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _degrees_between(a, b):
+    return math.degrees(math.atan2(Q.norm3(Q.cross3(a, b)), Q.dot3(a, b)))
+
+
+def _extend(phi, amount):
+    """Straighten a reaching arm: an elbow bent less than EXTEND_BELOW degrees is opened
+    along T * x^2 (2 - x), which meets the identity at T with the same slope, so nothing at
+    or past a right angle moves and nothing kinks where the curve hands over.
+
+    The second of two steps. _Solver._depth first takes out the bend the estimate put in
+    depth, where the camera-space body is there to tell depth from the screen; this opens
+    what is left, and is the only step for a file without it (BVH). At full strength 27
+    opens to 14, 45 to 34, 60 to 53; a guard at 90 and past is untouched.
+    """
+    bend = abs(phi)
+    t = math.radians(EXTEND_BELOW)
+    if bend >= t or amount <= 0.0:
+        return phi
+    x = bend / t
+    opened = t * x * x * (2.0 - x)
+    return math.copysign(bend + (opened - bend) * min(1.0, amount), phi)
+
 
 def _soft(dist, reach, had):
     """Soft IK: stretch past what the arm already had (`had`) and past the last
@@ -522,8 +575,10 @@ def _soft(dist, reach, had):
 
 
 class _Solver:
-    def __init__(self, motion: SomaMotion, armature: Armature, opts: RetargetOptions):
+    def __init__(self, motion: SomaMotion, armature: Armature, opts: RetargetOptions,
+                 incam: SomaMotion | None = None):
         self.m = motion
+        self.cam = incam
         self.sk = motion.skeleton
         self.rest = _rest(armature)
         self.opts = opts
@@ -543,6 +598,7 @@ class _Solver:
             self.rest_fold[limb.lower] = Q.signed_angle(
                 (0.0, 1.0, 0.0), Q.rotate(ql, (0.0, 1.0, 0.0)), (1.0, 0.0, 0.0))
         self.hinge_error = 0.0
+        self.straightened = 0
 
     def _bone_y(self, bone):
         return Q.rotate(self.rest.rot[bone], (0.0, 1.0, 0.0))
@@ -564,13 +620,19 @@ class _Solver:
         for limb in LIMBS:
             g_up = self.g(frame, limb.upper_src[0], yaw)
             g_low = self.g(frame, limb.lower_src[0], yaw)
+            open_by = 0.0
+            if limb.tool and opts.extend > 0.0:
+                open_by = min(1.0, opts.extend) * self._reaching(frame, yaw, g_up, limb)
+                if open_by > 0.0 and self.cam is not None:
+                    g_low = self._depth(frame, yaw, limb, g_up, g_low, open_by)
             up = Q.normalize(Q.mul(g_up, Q.mul(self.align[limb.upper], rest.rot[limb.upper])))
             low = Q.normalize(Q.mul(g_low, Q.mul(self.align[limb.lower],
                                                  rest.rot[limb.lower])))
             if self.body is not None and limb.tool:
-                up, low = self._reach(frame, yaw, limb, out, up, low)
+                up, low = self._reach(frame, yaw, limb, out, up, low, g_low, open_by)
             elif opts.hinge:
-                up, low = self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]))
+                up, low = self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]),
+                                      open_by)
             out[limb.upper], out[limb.lower] = up, low
             if limb.tool and limb.tool in rest.rot:
                 if opts.tools:
@@ -582,7 +644,54 @@ class _Solver:
                         Q.mul(low, Q.mul(Q.conj(rest.rot[limb.lower]), rest.rot[limb.tool])))
         return out
 
-    def _reach(self, frame, yaw, limb, out, up, low):
+    def _reaching(self, frame, yaw, g_up, limb):
+        """How much an arm is reaching, 0..1: its upper arm's angle from the torso's down
+        axis, ramped over REACH_RAISE. Punches measure 70-105 degrees, a walk's swing
+        10-50, so straightening reaches cannot straighten a walk."""
+        u = Q.rotate(g_up, self.src_dir[limb.upper])
+        down = Q.rotate(self.g(frame, "Chest", yaw), (0.0, 0.0, -1.0))
+        return _ramp(_degrees_between(u, down), *REACH_RAISE)
+
+    def _ray(self, frame, yaw, joint):
+        """The line of sight to `joint`, armature space: the camera-space body puts the
+        lens at the origin, and the Hips' two rotations turn it into the world's frame."""
+        hips = self.ix["Hips"]
+        to_cam = Q.mul(self.cam.rotations[frame][hips], Q.conj(self.m.rotations[frame][hips]))
+        seen = self.cam.positions(frame, (joint,))[joint]
+        return Q.rotate(Q.mul(yaw, SOMA_TO_EF), Q.rotate(Q.conj(to_cam), Q.unit3(seen)))
+
+    def _depth(self, frame, yaw, limb, g_up, g_low, amount):
+        """Re-choose a reaching forearm's depth. Returns its new world rotation.
+
+        What a video shows of a forearm is its direction across the frame; how far it tips
+        towards or away from the lens is the estimate's guess, and at a punch's peak the
+        guess is where the bend comes from - the forearm tipped 40-70% of its length
+        towards the camera, the upper arm flat. So the forearm is kept in the plane of its
+        on-screen direction and the line of sight, and turned within it towards the
+        direction there that is closest to the upper arm: the straightest arm the video
+        allows. Only up to DEPTH_BEND degrees of bend - a guard is folded whatever the
+        depth - and only as far as the upper arm agrees on screen with the forearm."""
+        u = Q.rotate(g_up, self.src_dir[limb.upper])
+        v = Q.unit3(Q.rotate(g_low, self.src_dir[limb.lower]))
+        w = amount * (1.0 - _ramp(_degrees_between(u, v), *DEPTH_BEND))
+        if w <= 0.0:
+            return g_low
+        r = self._ray(frame, yaw, limb.lower_src[0])
+        flat = Q.sub3(v, Q.scale3(r, Q.dot3(v, r)))
+        if Q.norm3(flat) < 1e-6:
+            return g_low
+        p = Q.unit3(flat)
+        along = Q.dot3(u, p) / max(1e-9, Q.norm3(u))
+        w *= _ramp(along, 0.0, 0.5)
+        if w <= 0.0:
+            return g_low
+        best = Q.unit3(Q.add3(Q.scale3(p, Q.dot3(u, p)), Q.scale3(r, Q.dot3(u, r))))
+        want = Q.unit3(Q.add3(Q.scale3(v, 1.0 - w), Q.scale3(best, w)), v)
+        if _degrees_between(v, want) > DEPTH_REPORT:
+            self.straightened += 1
+        return Q.normalize(Q.mul(Q.between(v, want), g_low))
+
+    def _reach(self, frame, yaw, limb, out, up, low, g_low, open_by=0.0):
         """Draw the hand in towards the midline by the body map and re-solve the arm onto
         it, keeping the person's swivel. Returns (upper, lower) world rotations.
 
@@ -605,8 +714,8 @@ class _Solver:
         pull = body.pull(across) * min(1.0, opts.hands)
         if pull <= 1e-6:
             if opts.hinge:
-                return self._hinge(limb, up, Q.rotate(self.g(frame, limb.lower_src[0], yaw),
-                                                      self.src_dir[limb.lower]))
+                return self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]),
+                                   open_by)
             return up, low
 
         shoulder = limb.upper.replace("Arm", "Shoulder")
@@ -636,13 +745,13 @@ class _Solver:
                                          Q.sub3(elbow, root)), up))
         want = Q.sub3(grip, elbow)
         if opts.hinge:
-            return self._hinge(limb, up, want)
+            return self._hinge(limb, up, want, open_by)
         low = Q.normalize(Q.mul(Q.between(Q.rotate(low, (0.0, 1.0, 0.0)), want), low))
         return up, low
 
-    def _hinge(self, limb, up, want_low_dir):
+    def _hinge(self, limb, up, want_low_dir, open_by=0.0):
         """Turn the upper bone about itself until the limb's bend lies in its hinge plane,
-        then fold the lower bone about the hinge alone."""
+        then fold the lower bone about the hinge alone - opened by _extend(open_by)."""
         rest = self.rest
         u = Q.rotate(up, (0.0, 1.0, 0.0))
         l = Q.unit3(want_low_dir)
@@ -662,6 +771,13 @@ class _Solver:
         got = Q.rotate(low, (0.0, 1.0, 0.0))
         err = math.degrees(math.acos(max(-1.0, min(1.0, Q.dot3(got, l)))))
         self.hinge_error = max(self.hinge_error, err)
+        if open_by > 0.0:
+            reach = _extend(phi, open_by)
+            if reach != phi:
+                fold = reach - self.rest_fold[limb.lower]
+                local = Q.mul(rest.local_rot[limb.lower],
+                              Q.from_axis_angle((1.0, 0.0, 0.0), fold))
+                low = Q.normalize(Q.mul(up, local))
         return up, low
 
     def heads(self, world, root_pos):
@@ -706,8 +822,9 @@ def retarget(motion: SomaMotion, armature: Armature, options=None, incam=None,
              intrinsics=None):
     """(AnimationDocument, RetargetReport) for `motion` on `armature`.
 
-    With `incam` - the same clip in camera space, GEM-X's body_params_incam - and the
-    camera `intrinsics`, the report also carries the video camera as a CameraTrack.
+    `incam` is the same clip in camera space, GEM-X's body_params_incam: it tells a
+    reaching arm's depth apart from its direction on screen (_Solver._depth), and with
+    the camera `intrinsics` the report also carries the video camera as a CameraTrack.
     """
     opts = options or RetargetOptions()
     check_armature(armature)
@@ -721,7 +838,7 @@ def retarget(motion: SomaMotion, armature: Armature, options=None, incam=None,
     motion = _window(motion, opts.start, opts.end)
     motion = _smooth(motion, float(opts.smoothing or 0.0), joints)
     motion = _resample(motion, _pick_fps(opts.fps, motion.fps), joints)
-    if incam is not None and not flipped and intrinsics:
+    if incam is not None and not flipped:
         incam = _window(incam, opts.start, opts.end)
         incam = _smooth(incam, float(opts.smoothing or 0.0), joints)
         incam = _resample(incam, motion.fps, joints)
@@ -732,7 +849,8 @@ def retarget(motion: SomaMotion, armature: Armature, options=None, incam=None,
         raise SomaError("no frames left to convert")
     report.frames_out, report.fps_out = n, motion.fps
 
-    solver = _Solver(motion, armature, opts)
+    solver = _Solver(motion, armature, opts,
+                     incam if incam is not None and incam.frame_count == n else None)
     ix = motion.skeleton.index
 
     yaw = Q.IDENTITY
@@ -792,7 +910,8 @@ def retarget(motion: SomaMotion, armature: Armature, options=None, incam=None,
         report.floor_offset = -floor
         roots = [(r[0], r[1], r[2] - floor) for r in roots]
     report.hinge_error_degrees = solver.hinge_error
-    if incam is not None and incam.frame_count == n:
+    report.arms_straightened = solver.straightened
+    if incam is not None and incam.frame_count == n and intrinsics:
         report.camera = _camera(motion, incam, intrinsics, yaw, scale,
                                 [p for p, _feet in soma_pos], roots)
 

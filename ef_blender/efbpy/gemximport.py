@@ -115,9 +115,10 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
     frame_end: IntProperty(name="Last frame", default=-1, min=-1,
                            description="Last video frame to use, -1 for the end")
     smoothing: FloatProperty(
-        name="Smoothing", default=1.0, min=0.0, max=10.0,
+        name="Smoothing", default=0.0, min=0.0, max=10.0,
         description="Gaussian filter width in video frames. 0 keeps GEM-X's output as it "
-                    "is")
+                    "is, which is already steady; a filter shaves the peak off fast moves "
+                    "- a punch at 24 fps lasts two or three frames")
 
     root_motion: EnumProperty(name="Root motion", items=_ROOT_MOTION, default=ROOT_FULL)
     face_forward: BoolProperty(
@@ -156,6 +157,14 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                     "0 copies the arms' angles. The biped's shoulders are 2.3 times as wide "
                     "as a person's, so copied angles turn hands at the chest into elbows "
                     "jabbed out at the sides")
+    extend: FloatProperty(
+        name="Straighten reaching arms", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
+        description="Straighten arms raised to reach or punch. A single camera guesses "
+                    "depth worst, and tips a punching forearm towards the lens: straight in "
+                    "the video, 50-60 degrees bent in 3D. The forearm keeps its direction on "
+                    "screen and takes the depth that bends it least, then elbows under 90 "
+                    "degrees are opened further. Guards and hanging or swinging arms are "
+                    "left alone")
     video_camera: BoolProperty(
         name="Video camera", default=True,
         description="Stand a camera where the video's was, with the video behind it, so "
@@ -200,7 +209,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                                "subject_height"), False),
                 ("Keys", ("keys", "key_tolerance"), False),
                 ("Video camera", ("video_camera", "video"), False),
-                ("Body", ("hands", "hinge", "tools", "clavicle", "keep_limits"), False),
+                ("Body", ("hands", "extend", "hinge", "tools", "clavicle",
+                          "keep_limits"), False),
                 ("Rig", ("variant", "body_mesh", "bake_ik"), False),
                 ("Armature source (optional)", ("entity", "armature_file", "jar"), True)):
             panel = getattr(layout, "panel", None)
@@ -223,7 +233,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
             smoothing=self.smoothing, root_motion=self.root_motion,
             face_forward=self.face_forward, start_at_origin=self.start_at_origin,
             ground=self.ground, subject_height=self.subject_height, hinge=self.hinge,
-            tools=self.tools, clavicle=self.clavicle, hands=self.hands)
+            tools=self.tools, clavicle=self.clavicle, hands=self.hands,
+            extend=self.extend)
 
     def execute(self, context):
         try:
@@ -238,8 +249,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                 armature = _armature(self.jar, _spawn_entity(self), self.armature_file)
             check_armature(armature)
             motion, incam, intrinsics = load_with_camera(self.filepath, self._file_fps())
-            doc, info = retarget(motion, armature, self.retarget_options(),
-                                 incam if self.video_camera else None, intrinsics)
+            doc, info = retarget(motion, armature, self.retarget_options(), incam,
+                                 intrinsics)
         except (SomaError, OSError, ValueError) as exc:
             self.report({"ERROR"}, "%s: %s" % (os.path.basename(self.filepath), exc))
             return {"CANCELLED"}

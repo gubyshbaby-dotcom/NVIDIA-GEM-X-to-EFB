@@ -26,7 +26,7 @@ from efb.animjson import save  # noqa: E402
 from efb.armature import Armature  # noqa: E402
 from efb.gemx import (KEYS_ALL, KEYS_PER_BONE, KEYS_SHARED, ROOT_FULL,  # noqa: E402
                       ROOT_IN_PLACE, RetargetOptions, retarget)
-from efb.soma import SomaError, describe, load_motion  # noqa: E402
+from efb.soma import SomaError, describe, load_with_camera  # noqa: E402
 
 
 def parse(argv=None):
@@ -44,8 +44,8 @@ def parse(argv=None):
                    help="rate of the clip written; 0 keeps the source's, up to 60")
     p.add_argument("--start", type=int, default=0, help="first source frame")
     p.add_argument("--end", type=int, default=-1, help="last source frame, -1 = end")
-    p.add_argument("--smooth", type=float, default=1.0,
-                   help="gaussian smoothing, sigma in source frames; 0 = off")
+    p.add_argument("--smooth", type=float, default=0.0,
+                   help="gaussian smoothing, sigma in source frames; 0 = off (default)")
     p.add_argument("--in-place", action="store_true",
                    help="drop the horizontal path, keep only the Root's height")
     p.add_argument("--keep-facing", action="store_true",
@@ -72,6 +72,10 @@ def parse(argv=None):
     p.add_argument("--hands", type=float, default=1.0,
                    help="1 (default) puts the hands where the person's are relative to "
                         "their body and solves the arms to reach; 0 copies arm angles")
+    p.add_argument("--extend", type=float, default=1.0,
+                   help="0..1, straighten arms raised to punch or reach: the forearm "
+                        "keeps its direction in the video and takes the depth that bends "
+                        "it least, then elbows under 90 degrees open further (default 1)")
     p.add_argument("--slim", action="store_true", help="the slim-armed (Alex) biped")
     p.add_argument("--armature", help="an Epic Fight armature json to retarget onto "
                                       "instead of the bundled biped")
@@ -103,13 +107,14 @@ def main(argv=None):
         root_motion=ROOT_IN_PLACE if a.in_place else ROOT_FULL,
         face_forward=not a.keep_facing, start_at_origin=not a.keep_origin,
         ground=not a.no_ground, subject_height=a.height, hinge=not a.no_hinge,
-        tools=not a.no_tools, clavicle=a.clavicle, hands=a.hands, markers=True,
+        tools=not a.no_tools, clavicle=a.clavicle, hands=a.hands, extend=a.extend,
+        markers=True,
         static_tracks=True,
         keys={"per-bone": KEYS_PER_BONE, "shared": KEYS_SHARED, "all": KEYS_ALL}[a.keys],
         key_tolerance=a.key_tolerance)
     try:
-        motion = load_motion(a.input, fps=a.fps_in)
-        doc, info = retarget(motion, armature, opts)
+        motion, incam, intrinsics = load_with_camera(a.input, fps=a.fps_in)
+        doc, info = retarget(motion, armature, opts, incam, intrinsics)
     except (SomaError, OSError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1

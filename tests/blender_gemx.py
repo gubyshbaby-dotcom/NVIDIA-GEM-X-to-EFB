@@ -26,7 +26,14 @@ from efb import bundled  # noqa: E402
 from efb.clip import pose_table_from_clip, read_document  # noqa: E402
 from efb.gemx import RetargetOptions, retarget  # noqa: E402
 from efb.rig import Rig  # noqa: E402
-from efb.soma import load_motion  # noqa: E402
+from efb.soma import load_with_camera  # noqa: E402
+
+
+def _retarget(path, arm, opts):
+    """The retarget as the import runs it: with the camera-space copy of the body, which
+    straightens reaching arms, when the file has one."""
+    motion, incam, intrinsics = load_with_camera(path, 30.0)
+    return retarget(motion, arm, opts, incam, intrinsics)
 
 
 def args():
@@ -78,8 +85,7 @@ def main():
 
     # What the retarget wrote, evaluated without Blender...
     arm = bundled.armature(rig.get("efb_armature", "biped"))
-    motion = load_motion(a["path"], fps=30.0)
-    doc, info = retarget(motion, arm, RetargetOptions())
+    doc, info = _retarget(a["path"], arm, RetargetOptions())
     rig_def = Rig(arm, coord=False)
     clip = read_document(rig_def, doc, info.fps_out)
     table = pose_table_from_clip(rig_def, clip)
@@ -169,7 +175,7 @@ def keys_hold(path, arm):
     from efbpy.animscene import action_curves, fk_controls
     from efbpy.keyposes import LOC_PER_DEGREE
 
-    dense, info = retarget(load_motion(path, fps=30.0), arm, RetargetOptions())
+    dense, info = _retarget(path, arm, RetargetOptions())
     for mode in ("PER_BONE", "SHARED"):
         _fresh()
         if bpy.ops.efb.import_gemx(filepath=path, keys=mode, key_tolerance=2.0) \
@@ -308,8 +314,7 @@ def export_matches(path, arm):
     if res != {"FINISHED"}:
         fail("export returned %s" % res)
     got = load(out)
-    want, _ = retarget(load_motion(path, fps=30.0), arm,
-                       RetargetOptions(markers=True, static_tracks=True))
+    want, _ = _retarget(path, arm, RetargetOptions(markers=True, static_tracks=True))
     if sorted(got.names) != sorted(want.names):
         fail("export writes %s, the retarget %s" % (got.names, want.names))
     worst_rot = worst_loc = 0.0

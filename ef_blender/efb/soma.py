@@ -501,9 +501,14 @@ def load_with_camera(path, fps=None):
     tree = _load_tree(path)
     world = motion_from_file(path, fps, "global", tree)
     try:
-        incam = motion_from_file(path, world.fps, "incam", tree)
+        _params, where = find_body_params(tree, "incam")
     except SomaError:
         return world, None, None
+    if "incam" not in where:
+        # the search settles for any body it finds; a file without the camera-space copy
+        # would hand back the world one, and a camera standing at the world's origin
+        return world, None, None
+    incam = motion_from_file(path, world.fps, "incam", tree)
     if incam.frame_count != world.frame_count:
         return world, None, None
     k = _mapping(tree).get("K_fullimg") if _mapping(tree) else None

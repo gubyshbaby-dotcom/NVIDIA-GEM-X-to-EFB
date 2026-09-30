@@ -31,7 +31,7 @@ from efb.gemx import (KEYS_PER_BONE, KEYS_SHARED, LOC_PER_DEGREE,  # noqa: E402
                       retarget)
 from efb.rig import Rig  # noqa: E402
 from efb.soma import (SomaError, SomaSkeleton, load_motion,  # noqa: E402
-                      motion_from_bvh, motion_from_params)
+                      load_with_camera, motion_from_bvh, motion_from_params)
 from efb.tensorio import Opaque, read_torch  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "data", "squat_hpe_results.pt")
@@ -184,13 +184,16 @@ class TestRetarget(unittest.TestCase):
         self.assertEqual(doc.tracks[0].name, "Root")
         rig = Rig(ARM, coord=False)
         table = pose_table_from_clip(rig, read_document(rig, doc, rep.fps_out))
-        feet = []
+        lowest = []
         for i in range(len(table.frames)):
+            feet = []
             for leg in ("Leg_R", "Leg_L"):
                 m = table.world[leg][i]
                 tip = m.transform_point((0.0, 0.3864, 0.0))
                 feet.append(min(tip[2], m.to_translation()[2]))
-        self.assertAlmostEqual(sorted(feet)[len(feet) // 50], 0.0, places=3)
+            lowest.append(min(feet))
+        lowest.sort()
+        self.assertAlmostEqual(lowest[int(round(0.02 * (len(lowest) - 1)))], 0.0, places=4)
         self.assertEqual(loads(dumps(doc)).to_json(), doc.to_json())
         for track in doc.tracks:
             self.assertTrue(all(b > a for a, b in zip(track.times, track.times[1:])))
@@ -282,6 +285,32 @@ class TestRetarget(unittest.TestCase):
         self.assertGreater(grip[0.0][0], 0.05)
         self.assertLess(grip[1.0][0], -0.05)
 
+    def test_reaching_arms_open_smoothly(self):
+        from efb.gemx import EXTEND_BELOW, _extend
+        t = math.radians(EXTEND_BELOW)
+        self.assertEqual(_extend(t, 1.0), t)
+        self.assertEqual(_extend(-2.0, 1.0), -2.0)
+        self.assertAlmostEqual(math.degrees(_extend(math.radians(27.0), 1.0)), 13.77, places=2)
+        self.assertEqual(_extend(math.radians(27.0), 0.0), math.radians(27.0))
+        eps = 1e-6
+        slope = (_extend(t - eps, 1.0) - _extend(t - 2 * eps, 1.0)) / eps
+        self.assertAlmostEqual(slope, 1.0, places=4)
+        self.assertLess(_extend(-0.3, 1.0), 0.0)
+
+    def test_a_jab_opens_on_the_hinge(self):
+        # Right forearm 27 degrees off straight, forward: the biped's opens to ~14.
+        doc, _rep, t = solve(RetargetOptions(smoothing=0.0, hands=0.0),
+                             overrides={"RightForeArm": (0.0, math.radians(27.0), 0.0)})
+        rot = doc.track("Hand_R").keys[0].rot
+        self.assertAlmostEqual(rot[2], 0.0, places=5)
+        fold = math.degrees(2 * math.atan2(rot[1], rot[0]))
+        self.assertAlmostEqual(fold, 13.77 + 6.31, delta=0.1)
+        doc, _rep, t = solve(RetargetOptions(smoothing=0.0, hands=0.0, extend=0.0),
+                             overrides={"RightForeArm": (0.0, math.radians(27.0), 0.0)})
+        rot = doc.track("Hand_R").keys[0].rot
+        self.assertAlmostEqual(math.degrees(2 * math.atan2(rot[1], rot[0])), 27.0 + 6.31,
+                               delta=0.1)
+
     def test_not_a_biped(self):
         arm = bundled.armature("biped")
         arm.joints.pop("Tool_R")
@@ -327,6 +356,60 @@ class TestVideoCamera(unittest.TestCase):
             Q.from_axis_angle((0, 0, 1), math.radians(rep.turned_degrees)), SOMA_TO_EF),
             Q.scale3(Q.sub3(wld.hips[0], pelvis_h), rep.leg_scale))), track.location[0]))
         self.assertGreater(Q.dot3(forward, hips_dir), math.cos(math.radians(0.5)))
+
+
+class TestReachingArms(unittest.TestCase):
+    """A right arm filmed from its own side, the camera 4 m off along -X, its forearm
+    tipped towards the lens: in the video it runs where the upper arm runs, in 3D it is
+    bent. Rotations are about SOMA's Y (up) or Z; the T-pose arm points along -X."""
+
+    CAM = (-4.0, 1.3, 0.2)
+
+    def film(self, arm, fore, incam=True):
+        go, bp, tr = params(frames=2, overrides={"RightArm": arm, "RightForeArm": fore})
+        world = motion_from_params(go, bp, tr, fps=30.0)
+        cam = None
+        if incam:
+            z = Q.unit3(Q.sub3(world.hips[0], self.CAM))
+            x = Q.unit3(Q.cross3((0.0, -1.0, 0.0), z))
+            r = Q.from_rows((x, Q.cross3(z, x), z))
+            cam = motion_from_params([_rotvec(r)] * 2, bp,
+                                     [Q.rotate(r, Q.sub3(h, self.CAM)) for h in world.hips],
+                                     30.0)
+        doc, rep = retarget(world, ARM, RetargetOptions(hands=0.0), cam,
+                            (1000.0, 1000.0, 640.0, 360.0) if incam else None)
+        rot = doc.track("Hand_R").keys[0].rot
+        return abs(math.degrees(2 * math.atan2(rot[1], rot[0]))) - 6.31, rep
+
+    def jab(self, bend, incam=True):
+        # upper arm straight forward (+Z), forearm turned `bend` degrees towards -X
+        return self.film((0.0, math.pi / 2, 0.0), (0.0, -math.radians(bend), 0.0), incam)
+
+    def test_a_jab_bent_in_depth_comes_out_straight(self):
+        bend, rep = self.jab(50.0)
+        self.assertLess(bend, 1.0)
+        self.assertEqual(rep.arms_straightened, 2)
+
+    def test_without_the_camera_only_the_curve_opens_it(self):
+        bend, rep = self.jab(50.0, incam=False)
+        self.assertAlmostEqual(bend, 40.12, delta=0.1)
+        self.assertEqual(rep.arms_straightened, 0)
+
+    def test_a_guard_keeps_its_fold(self):
+        bend, _rep = self.jab(110.0)
+        self.assertAlmostEqual(bend, 110.0, delta=0.1)
+
+    def test_a_hanging_arm_is_not_reaching(self):
+        # upper arm straight down, forearm tipped 50 degrees towards the lens
+        bend, rep = self.film((0.0, 0.0, math.pi / 2), (0.0, 0.0, -math.radians(50.0)))
+        self.assertAlmostEqual(bend, 50.0, delta=0.1)
+        self.assertEqual(rep.arms_straightened, 0)
+
+    def test_no_camera_copy_no_camera(self):
+        # the fixture holds body_params_global alone; the search must not hand it back
+        # as the camera-space copy
+        _world, incam, _k = load_with_camera(FIXTURE, 30.0)
+        self.assertIsNone(incam)
 
 
 def _full(motion):

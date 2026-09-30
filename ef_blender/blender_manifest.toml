@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "ef_blender"
-version = "0.27.0"
+version = "0.28.0"
 name = "Epic Fight / VIX"
 tagline = "Epic Fight rigs and animations, GEM-X mocap, VIX camera shots"
 maintainer = "epic-port"
