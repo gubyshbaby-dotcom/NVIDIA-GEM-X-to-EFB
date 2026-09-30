@@ -10,6 +10,9 @@ handles are baked off it so any limb can be flipped to IK and worked on.
 The keys are an Epic Fight clip from the start, so File > Export > Epic Fight Animation
 writes it for the game with nothing further to do.
 
+With "Video camera" on, efbpy.videocam also stands a camera where the video's was, with
+the video behind it, so the rig can be checked against the person through it.
+
 The capture is a key per frame, which nobody can edit, so by default the FK keys are then
 rebuilt by efbpy.keyposes as a few keys per bone on smooth curves, inside a tolerance in
 degrees; "Key poses" puts every bone's keys on the same frames instead, and "Every frame"
@@ -35,11 +38,12 @@ from bpy_extras.io_utils import ImportHelper
 
 from efb import bundled
 from efb.clip import pose_table_from_clip, read_document
-from efb.gemx import ROOT_FULL, ROOT_IN_PLACE, RetargetOptions, check_armature, retarget
+from efb.gemx import (CLAVICLE_MATCH, ROOT_FULL, ROOT_IN_PLACE, RetargetOptions,
+                      check_armature, retarget)
 from efb.rig import COORD_BONE, Rig
-from efb.soma import DEFAULT_FPS, SomaError, load_motion
+from efb.soma import DEFAULT_FPS, SomaError, load_with_camera
 
-from . import keyposes
+from . import keyposes, videocam
 from .animops import _armature, _rig_armature, _spawn_entity, _do_import, existing_rig
 from .ops import BUILDS
 
@@ -141,8 +145,25 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
         description="Turn Tool_R / Tool_L with the real wrist, so a held item follows "
                     "the hand")
     clavicle: FloatProperty(
-        name="Collarbones", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
-        description="How much of the collarbones' motion the shoulders take")
+        name="Collarbones", default=CLAVICLE_MATCH, min=0.0, max=1.0, subtype="FACTOR",
+        description="How much of the collarbones' turn the shoulders take. The biped's "
+                    "shoulder bone is 2.5 times a collarbone, so 1.0 swings the arm root "
+                    "2.5 times as far as the person's moved and 0.4 moves it as far")
+    hands: FloatProperty(
+        name="Hands follow the body", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
+        description="1 puts the hands where the person's are relative to their body - at "
+                    "the chest, on the hips, at the face - and solves the arms to reach; "
+                    "0 copies the arms' angles. The biped's shoulders are 2.3 times as wide "
+                    "as a person's, so copied angles turn hands at the chest into elbows "
+                    "jabbed out at the sides")
+    video_camera: BoolProperty(
+        name="Video camera", default=True,
+        description="Stand a camera where the video's was, with the video behind it, so "
+                    "the rig can be checked against the person frame by frame (Numpad 0)")
+    video: StringProperty(
+        name="Video", default="", subtype="FILE_PATH",
+        description="Video to show behind the camera. Blank finds the copy GEM-X keeps "
+                    "next to hpe_results.pt")
     keys: EnumProperty(name="Keys", items=keyposes.MODES, default=keyposes.DEFAULT_MODE,
                        description="How the clip is keyed on the rig")
     key_tolerance: FloatProperty(
@@ -178,7 +199,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                 ("Placement", ("root_motion", "face_forward", "start_at_origin", "ground",
                                "subject_height"), False),
                 ("Keys", ("keys", "key_tolerance"), False),
-                ("Body", ("hinge", "tools", "clavicle", "keep_limits"), False),
+                ("Video camera", ("video_camera", "video"), False),
+                ("Body", ("hands", "hinge", "tools", "clavicle", "keep_limits"), False),
                 ("Rig", ("variant", "body_mesh", "bake_ik"), False),
                 ("Armature source (optional)", ("entity", "armature_file", "jar"), True)):
             panel = getattr(layout, "panel", None)
@@ -201,7 +223,7 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
             smoothing=self.smoothing, root_motion=self.root_motion,
             face_forward=self.face_forward, start_at_origin=self.start_at_origin,
             ground=self.ground, subject_height=self.subject_height, hinge=self.hinge,
-            tools=self.tools, clavicle=self.clavicle)
+            tools=self.tools, clavicle=self.clavicle, hands=self.hands)
 
     def execute(self, context):
         try:
@@ -215,8 +237,9 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
             else:
                 armature = _armature(self.jar, _spawn_entity(self), self.armature_file)
             check_armature(armature)
-            motion = load_motion(self.filepath, fps=self._file_fps())
-            doc, info = retarget(motion, armature, self.retarget_options())
+            motion, incam, intrinsics = load_with_camera(self.filepath, self._file_fps())
+            doc, info = retarget(motion, armature, self.retarget_options(),
+                                 incam if self.video_camera else None, intrinsics)
         except (SomaError, OSError, ValueError) as exc:
             self.report({"ERROR"}, "%s: %s" % (os.path.basename(self.filepath), exc))
             return {"CANCELLED"}
@@ -231,6 +254,7 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
         keys = keyposes.reduce_keys(rig, degrees=self.key_tolerance, mode=self.keys,
                                     frame_range=(0, info.frames_out - 1))
         baked = self._bake(context, rig, info.frames_out) if self.bake_ik else 0
+        cam_note = self._camera(context, rig, info)
         action = rig.animation_data.action if rig and rig.animation_data else None
         if action is not None:
             action[GEMX_PROP] = json.dumps({
@@ -246,6 +270,8 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
                                                 % keys[2] if keys[2] else ""))
         if baked:
             extra.append("IK baked on %d limbs" % baked)
+        if cam_note:
+            extra.append(cam_note)
         if limits_off:
             extra.append("Joint Limits switched off - the capture goes past them on %s"
                          % ", ".join("%s (%d frames)" % (n, c)
@@ -253,6 +279,22 @@ class EFB_OT_import_gemx(bpy.types.Operator, ImportHelper):
         self.report({"WARNING"} if limits_off else {"INFO"},
                     "GEM-X: %s%s" % (info.summary(), "; " + "; ".join(extra) if extra else ""))
         return {"FINISHED"}
+
+    def _camera(self, context, rig, info) -> str:
+        """The video camera, when asked for and the file has the camera-space copy."""
+        if not self.video_camera or info.camera is None:
+            return ""
+        video = bpy.path.abspath(self.video) if self.video else \
+            videocam.find_video(self.filepath, clip_label(self.filepath))
+        if video and not os.path.isfile(video):
+            video = None
+        cam = videocam.build_camera(rig, info.camera, context, video,
+                                    first_frame=self.frame_start)
+        note = "camera %s%s" % (cam.name, ", video behind it" if video else
+                                ", no video found to put behind it")
+        if video and abs(info.fps_out - info.fps_in) > 1e-6:
+            note += " (clip rate differs from the video's, so they drift apart)"
+        return note
 
     def _settle_limits(self, context, rig, armature, doc, fps) -> dict:
         """Switch the rig's stops off when they would change the clip. Returns the bones

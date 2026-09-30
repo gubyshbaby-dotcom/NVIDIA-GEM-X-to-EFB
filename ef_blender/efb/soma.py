@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from . import quat as Q
 from .tensorio import Opaque, Tensor, TensorIOError, read_npz, read_torch, walk
 
-__all__ = ["SomaSkeleton", "SomaMotion", "SomaError", "load_motion", "motion_from_params",
+__all__ = ["SomaSkeleton", "SomaMotion", "SomaError", "load_motion", "load_with_camera",
+           "motion_from_params",
            "motion_from_bvh", "find_body_params", "BODY_JOINTS", "SOMA_JOINT_COUNT",
            "DEFAULT_FPS"]
 
@@ -314,8 +315,8 @@ def _load_tree(path):
         raise SomaError(str(exc)) from None
 
 
-def motion_from_file(path, fps=None, which="global"):
-    tree = _load_tree(path)
+def motion_from_file(path, fps=None, which="global", tree=None):
+    tree = _load_tree(path) if tree is None else tree
     params, where = find_body_params(tree, which)
     rate = fps
     if not rate:
@@ -329,7 +330,7 @@ def motion_from_file(path, fps=None, which="global"):
                 break
     motion = motion_from_params(params["global_orient"], params["body_pose"],
                                 params["transl"], rate or DEFAULT_FPS,
-                                source=str(path), kind="gem-x")
+                                source=str(path), kind="gem-x" if which == "global" else which)
     if where:
         motion.notes.insert(0, "read %s" % where)
     if not rate:
@@ -484,6 +485,33 @@ def load_motion(path, fps=None, which="global") -> SomaMotion:
     if ext == ".bvh":
         return motion_from_bvh(path, fps)
     return motion_from_file(path, fps, which)
+
+
+def load_with_camera(path, fps=None):
+    """(world motion, camera-space motion or None, intrinsics or None) from one read.
+
+    GEM-X saves the same body twice: body_params_global in the gravity-aligned world and
+    body_params_incam in the camera's frame. Between them they say where the camera was on
+    every frame, which is what lets the add-on stand a Blender camera where the phone
+    stood. intrinsics is (fx, fy, cx, cy) from K_fullimg, pixels.
+    """
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext == ".bvh":
+        return motion_from_bvh(path, fps), None, None
+    tree = _load_tree(path)
+    world = motion_from_file(path, fps, "global", tree)
+    try:
+        incam = motion_from_file(path, world.fps, "incam", tree)
+    except SomaError:
+        return world, None, None
+    if incam.frame_count != world.frame_count:
+        return world, None, None
+    k = _mapping(tree).get("K_fullimg") if _mapping(tree) else None
+    intr = None
+    if isinstance(k, Tensor) and k.numel >= 9:
+        d = k.data
+        intr = (float(d[0]), float(d[4]), float(d[2]), float(d[5]))
+    return world, incam, intr
 
 
 def describe(path) -> str:

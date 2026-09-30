@@ -60,14 +60,18 @@ def parse(argv=None):
                    help="copy forearm and shin roll instead of folding on the hinge")
     p.add_argument("--no-tools", action="store_true",
                    help="leave Tool_R / Tool_L at rest in the hand")
-    p.add_argument("--clavicle", type=float, default=1.0,
-                   help="share of the collarbones' motion the shoulders take, 0..1")
+    p.add_argument("--clavicle", type=float, default=0.4,
+                   help="share of the collarbones' turn the shoulders take, 0..1; 0.4 "
+                        "moves the arm root as far as the person's collarbone moved it")
     p.add_argument("--keys", choices=("per-bone", "shared", "all"), default="per-bone",
                    help="per-bone (default) keeps on each track only the keys Epic Fight's "
                         "own lerp cannot recreate; shared keeps the same frames on every "
                         "track; all keeps every frame")
     p.add_argument("--key-tolerance", type=float, default=0.5,
                    help="degrees a joint may stray between kept keys (default 0.5)")
+    p.add_argument("--hands", type=float, default=1.0,
+                   help="1 (default) puts the hands where the person's are relative to "
+                        "their body and solves the arms to reach; 0 copies arm angles")
     p.add_argument("--slim", action="store_true", help="the slim-armed (Alex) biped")
     p.add_argument("--armature", help="an Epic Fight armature json to retarget onto "
                                       "instead of the bundled biped")
@@ -99,7 +103,8 @@ def main(argv=None):
         root_motion=ROOT_IN_PLACE if a.in_place else ROOT_FULL,
         face_forward=not a.keep_facing, start_at_origin=not a.keep_origin,
         ground=not a.no_ground, subject_height=a.height, hinge=not a.no_hinge,
-        tools=not a.no_tools, clavicle=a.clavicle, markers=True, static_tracks=True,
+        tools=not a.no_tools, clavicle=a.clavicle, hands=a.hands, markers=True,
+        static_tracks=True,
         keys={"per-bone": KEYS_PER_BONE, "shared": KEYS_SHARED, "all": KEYS_ALL}[a.keys],
         key_tolerance=a.key_tolerance)
     try:

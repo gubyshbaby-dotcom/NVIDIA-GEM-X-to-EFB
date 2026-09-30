@@ -18,6 +18,7 @@
   efbpy.animops     import/export operators and their File menu entries
   efbpy.gemximport  NVIDIA GEM-X / SOMA video mocap -> an Epic Fight clip on the rig
   efbpy.keyposes    a key-per-frame clip rebuilt as few keys on smooth curves
+  efbpy.videocam    the video's camera beside the rig, with the video behind it
   efbpy.buildswitch wide <-> slim on an existing rig, in place
   efbpy.migrate     carrying an action forward from an older rig
   efbpy.rootcarry   handing an older rig's loose handles and poles to the root, in place

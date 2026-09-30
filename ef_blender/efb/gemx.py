@@ -54,7 +54,8 @@ from .soma import SomaError, SomaMotion, SomaSkeleton, load_motion
 __all__ = ["RetargetOptions", "RetargetReport", "retarget", "convert_file",
            "SOMA_TO_EF", "BODY_SOURCES", "LIMBS", "ROOT_FULL", "ROOT_IN_PLACE",
            "HINGE_FADE", "required_joints", "check_armature", "SomaError",
-           "KEYS_ALL", "KEYS_SHARED", "KEYS_PER_BONE", "reduce_tracks"]
+           "KEYS_ALL", "KEYS_SHARED", "KEYS_PER_BONE", "reduce_tracks",
+           "CLAVICLE_MATCH", "CameraTrack"]
 
 SOMA_TO_EF = Q.from_rows(((-1.0, 0.0, 0.0),
                           (0.0, 0.0, 1.0),
@@ -68,6 +69,10 @@ KEYS_SHARED = "SHARED"
 KEYS_PER_BONE = "PER_BONE"
 
 LOC_PER_DEGREE = 0.005
+
+CLAVICLE_MATCH = 0.4
+
+CAMERA_FLIP = (0.0, 1.0, 0.0, 0.0)
 
 HINGE_FADE = (8.0, 20.0)
 
@@ -130,7 +135,16 @@ class RetargetOptions:
     stride          horizontal scale, 0 is the leg-length ratio
     hinge           solve elbows and knees as hinges (see the module docstring)
     tools           give the wrist's orientation to Tool_R / Tool_L
-    clavicle        how much of the collarbones' motion the shoulders take, 0..1
+    clavicle        how much of the collarbones' turn the shoulders take, 0..1. The
+                    biped's Shoulder bone runs 0.394 m from mid-chest to the arm root, a
+                    collarbone 0.155 m, so a full share swings the arm root 2.5 times as
+                    far as the person's moved; CLAVICLE_MATCH moves it as far
+    hands           0 copies the arms' angles; 1 draws a hand the person holds in front
+                    of their body in towards the biped's midline by the shoulder width
+                    the person does not have (see _BodyMap) and solves the arm to reach
+                    it. The biped's arm roots are 2.3 times as far apart as a person's,
+                    so copied angles turn hands held at the chest into elbows jabbed out
+                    at the sides
     markers         write Elbow_* / Knee_* seam tracks - for a json going straight into
                     the game; the Blender rig slides them itself
     static_tracks   write rest tracks for joints nothing drives, as shipped clips do
@@ -155,11 +169,34 @@ class RetargetOptions:
     stride: float = 0.0
     hinge: bool = True
     tools: bool = True
-    clavicle: float = 1.0
+    clavicle: float = 0.4
+    hands: float = 1.0
     markers: bool = False
     static_tracks: bool = False
     keys: str = KEYS_ALL
     key_tolerance: float = 0.5
+
+
+@dataclass
+class CameraTrack:
+    """The video camera, per output frame, in the rig's armature space and at the rig's
+    scale: stand a Blender camera here with this lens and the biped covers the person the
+    way GEM-X's mesh covers them in its incam video. `rotation` is a Blender camera's
+    (looking down -Z, Y up), (w, x, y, z)."""
+    location: list
+    rotation: list
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+
+    @property
+    def width(self) -> int:
+        return int(round(2.0 * self.cx))
+
+    @property
+    def height(self) -> int:
+        return int(round(2.0 * self.cy))
 
 
 @dataclass
@@ -179,6 +216,7 @@ class RetargetReport:
     keys_dense: int = 0
     keys_kept: int = 0
     key_frames: int = 0
+    camera: "CameraTrack | None" = None
     notes: list = field(default_factory=list)
 
     @property
@@ -428,6 +466,61 @@ def _x_angle(q):
     return math.degrees(math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y)))
 
 
+class _BodyMap:
+    """Where the biped's hands go when the person's are held in towards their own middle.
+
+    The two bodies disagree about one thing that angles cannot carry: width. A person's
+    arm roots sit 0.16 m either side of the spine, the biped's 0.375 m - 2.3 times as far
+    apart, with arms no longer - so copied angles leave every hand the person brings in
+    front of their chest a hand's width out at the biped's side, which reads as an elbow
+    jabbed out. Height and depth agree well enough with the angles and are left to them;
+    across the body, a hand inside the person's shoulder line is drawn in by the part of
+    the biped's shoulder width the person does not have - all of it at the midline, none
+    at the shoulder, so the map is continuous and leaves an arm out at the side alone.
+    """
+
+    def __init__(self, motion: SomaMotion, rest: "_Rest"):
+        pos = _tpose_positions(motion)
+        ix = motion.skeleton.index
+
+        def ef(name):
+            return Q.rotate(SOMA_TO_EF, pos[ix[name]])
+
+        palm = Q.scale3(Q.add3(ef("RightHand"), ef("RightHandMiddle1")), 0.5)
+        arm_h = (Q.norm3(Q.sub3(ef("RightForeArm"), ef("RightArm")))
+                 + Q.norm3(Q.sub3(palm, ef("RightForeArm"))))
+        self.anchor = Q.sub3(Q.scale3(Q.add3(pos[ix["RightArm"]], pos[ix["LeftArm"]]), 0.5),
+                             pos[ix["Chest"]])
+        self.human = abs(ef("RightArm")[0] - ef("LeftArm")[0]) * 0.5
+        head = rest.head
+        self.biped = abs(head["Arm_R"][0] - head["Arm_L"][0]) * 0.5
+        self.upper = Q.norm3(rest.local_t["Hand_R"])
+        self.lower = Q.norm3(rest.local_t["Tool_R"])
+        self.reach = (self.upper + self.lower) / arm_h
+        self.excess = max(0.0, self.biped - self.human * self.reach)
+
+    def pull(self, across):
+        """How far in to draw a hand `across` metres out from the person's midline on its
+        own side (negative once it has crossed)."""
+        share = (self.human - across) / self.human
+        return self.excess * min(1.0, max(0.0, share))
+
+
+SOFT_REACH = 0.08
+
+
+def _soft(dist, reach, had):
+    """Soft IK: stretch past what the arm already had (`had`) and past the last
+    SOFT_REACH of its reach is approached asymptotically, so a target hovering at full
+    stretch cannot flick the elbow between bent and locked - and a target the copied angles
+    already reach is reached exactly, which keeps the pull continuous from zero."""
+    knee = max(reach * (1.0 - SOFT_REACH), min(had, reach - 1e-6))
+    if dist <= knee:
+        return dist
+    room = reach - knee
+    return reach - room * math.exp(-(dist - knee) / room)
+
+
 class _Solver:
     def __init__(self, motion: SomaMotion, armature: Armature, opts: RetargetOptions):
         self.m = motion
@@ -436,6 +529,7 @@ class _Solver:
         self.opts = opts
         ix = self.sk.index
         self.ix = ix
+        self.body = _BodyMap(motion, self.rest) if opts.hands > 0.0 else None
         self.align = {}
         self.src_dir = {}
         for limb in LIMBS:
@@ -473,7 +567,9 @@ class _Solver:
             up = Q.normalize(Q.mul(g_up, Q.mul(self.align[limb.upper], rest.rot[limb.upper])))
             low = Q.normalize(Q.mul(g_low, Q.mul(self.align[limb.lower],
                                                  rest.rot[limb.lower])))
-            if opts.hinge:
+            if self.body is not None and limb.tool:
+                up, low = self._reach(frame, yaw, limb, out, up, low)
+            elif opts.hinge:
                 up, low = self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]))
             out[limb.upper], out[limb.lower] = up, low
             if limb.tool and limb.tool in rest.rot:
@@ -485,6 +581,64 @@ class _Solver:
                     out[limb.tool] = Q.normalize(
                         Q.mul(low, Q.mul(Q.conj(rest.rot[limb.lower]), rest.rot[limb.tool])))
         return out
+
+    def _reach(self, frame, yaw, limb, out, up, low):
+        """Draw the hand in towards the midline by the body map and re-solve the arm onto
+        it, keeping the person's swivel. Returns (upper, lower) world rotations.
+
+        The hand the copied angles give is the starting point, so height, depth and every
+        pose with the hand out at the side come through untouched; only the across-the-body
+        position moves, and the arm is re-solved - two bones, the elbow turned the way the
+        person's points - to reach it.
+        """
+        rest, body, opts = self.rest, self.body, self.opts
+        side = "Right" if limb.upper.endswith("_R") else "Left"
+        outward = 1.0 if side == "Right" else -1.0
+        carry = Q.mul(yaw, SOMA_TO_EF)
+        p = self.m.positions(frame, ("Chest", side + "Arm", side + "ForeArm", side + "Hand",
+                                     side + "HandMiddle1"))
+        palm = Q.scale3(Q.add3(p[side + "Hand"], p[side + "HandMiddle1"]), 0.5)
+        anchor = Q.add3(p["Chest"], Q.rotate(self.m.rotations[frame][self.ix["Chest"]],
+                                             body.anchor))
+        g_chest = self.g(frame, "Chest", yaw)
+        across = outward * Q.rotate(Q.conj(g_chest), Q.rotate(carry, Q.sub3(palm, anchor)))[0]
+        pull = body.pull(across) * min(1.0, opts.hands)
+        if pull <= 1e-6:
+            if opts.hinge:
+                return self._hinge(limb, up, Q.rotate(self.g(frame, limb.lower_src[0], yaw),
+                                                      self.src_dir[limb.lower]))
+            return up, low
+
+        shoulder = limb.upper.replace("Arm", "Shoulder")
+        root = Q.add3(Q.rotate(out["Chest"], rest.local_t[shoulder]),
+                      Q.rotate(out[shoulder], rest.local_t[limb.upper]))
+        elbow_fk = Q.add3(root, Q.rotate(up, rest.local_t[limb.lower]))
+        grip_fk = Q.add3(elbow_fk, Q.rotate(low, rest.local_t[limb.tool]))
+        target = Q.sub3(grip_fk, Q.rotate(g_chest, (outward * pull, 0.0, 0.0)))
+
+        a, b = body.upper, body.lower
+        d = Q.sub3(target, root)
+        dist = max(abs(a - b) + 1e-3,
+                   _soft(Q.norm3(d), a + b, Q.norm3(Q.sub3(grip_fk, root))))
+        e1 = Q.unit3(d)
+        bend = Q.sub3(elbow_fk, root)
+        swivel = Q.rotate(carry, Q.sub3(p[side + "ForeArm"], p[side + "Arm"]))
+        pole = Q.sub3(swivel, Q.scale3(e1, Q.dot3(swivel, e1)))
+        if Q.norm3(pole) < 0.02:
+            pole = Q.sub3(bend, Q.scale3(e1, Q.dot3(bend, e1)))
+        e2 = Q.unit3(pole, (0.0, -1.0, 0.0))
+        cos_a = max(-1.0, min(1.0, (a * a + dist * dist - b * b) / (2.0 * a * dist)))
+        sin_a = math.sqrt(max(0.0, 1.0 - cos_a * cos_a))
+        elbow = Q.add3(root, Q.scale3(Q.add3(Q.scale3(e1, cos_a), Q.scale3(e2, sin_a)), a))
+        grip = Q.add3(root, Q.scale3(e1, dist))
+
+        up = Q.normalize(Q.mul(Q.between(Q.rotate(up, (0.0, 1.0, 0.0)),
+                                         Q.sub3(elbow, root)), up))
+        want = Q.sub3(grip, elbow)
+        if opts.hinge:
+            return self._hinge(limb, up, want)
+        low = Q.normalize(Q.mul(Q.between(Q.rotate(low, (0.0, 1.0, 0.0)), want), low))
+        return up, low
 
     def _hinge(self, limb, up, want_low_dir):
         """Turn the upper bone about itself until the limb's bend lies in its hinge plane,
@@ -548,8 +702,13 @@ class _Solver:
         return out
 
 
-def retarget(motion: SomaMotion, armature: Armature, options=None):
-    """(AnimationDocument, RetargetReport) for `motion` on `armature`."""
+def retarget(motion: SomaMotion, armature: Armature, options=None, incam=None,
+             intrinsics=None):
+    """(AnimationDocument, RetargetReport) for `motion` on `armature`.
+
+    With `incam` - the same clip in camera space, GEM-X's body_params_incam - and the
+    camera `intrinsics`, the report also carries the video camera as a CameraTrack.
+    """
     opts = options or RetargetOptions()
     check_armature(armature)
     report = RetargetReport(source=motion.source, kind=motion.kind,
@@ -562,6 +721,12 @@ def retarget(motion: SomaMotion, armature: Armature, options=None):
     motion = _window(motion, opts.start, opts.end)
     motion = _smooth(motion, float(opts.smoothing or 0.0), joints)
     motion = _resample(motion, _pick_fps(opts.fps, motion.fps), joints)
+    if incam is not None and not flipped and intrinsics:
+        incam = _window(incam, opts.start, opts.end)
+        incam = _smooth(incam, float(opts.smoothing or 0.0), joints)
+        incam = _resample(incam, motion.fps, joints)
+    else:
+        incam = None
     n = motion.frame_count
     if n == 0:
         raise SomaError("no frames left to convert")
@@ -627,12 +792,40 @@ def retarget(motion: SomaMotion, armature: Armature, options=None):
         report.floor_offset = -floor
         roots = [(r[0], r[1], r[2] - floor) for r in roots]
     report.hinge_error_degrees = solver.hinge_error
+    if incam is not None and incam.frame_count == n:
+        report.camera = _camera(motion, incam, intrinsics, yaw, scale,
+                                [p for p, _feet in soma_pos], roots)
 
     doc = _document(armature, rest, worlds, roots, motion.fps, opts)
     report.keys_dense = sum(len(t) for t in doc.tracks)
     doc.tracks, report.key_frames = reduce_tracks(doc.tracks, opts.keys, opts.key_tolerance)
     report.keys_kept = sum(len(t) for t in doc.tracks)
     return doc, report
+
+
+def _camera(world, incam, intrinsics, yaw, scale, pelvis, roots) -> CameraTrack:
+    """Where the phone was, frame by frame, carried into the rig's space.
+
+    The two parameter sets are one body seen from two frames, so the Hips' rotation and
+    position in each give the world-to-camera transform outright:
+        R = G_incam[Hips] @ G_world[Hips]^-1      camera = hips_world - R^-1 hips_incam
+    The camera is then placed against the pelvis rather than the world, and at the rig's
+    scale, so it frames the biped exactly as the clip's own root placement - in place,
+    turned to face forward, dropped onto the floor - leaves it.
+    """
+    hips = world.skeleton.index["Hips"]
+    carry = Q.mul(yaw, SOMA_TO_EF)
+    loc, rot = [], []
+    for f in range(world.frame_count):
+        r = Q.normalize(Q.mul(incam.rotations[f][hips], Q.conj(world.rotations[f][hips])))
+        cam = Q.sub3(world.hips[f], Q.rotate(Q.conj(r), incam.hips[f]))
+        offset = Q.rotate(carry, Q.scale3(Q.sub3(cam, pelvis[f]), scale))
+        loc.append(Q.add3(roots[f], offset))
+        rot.append(Q.normalize(Q.mul(Q.mul(carry, Q.conj(r)), CAMERA_FLIP)))
+    for i in range(1, len(rot)):
+        rot[i] = Q.align(rot[i], rot[i - 1])
+    fx, fy, cx, cy = intrinsics
+    return CameraTrack(loc, rot, fx, fy, cx, cy)
 
 
 def _document(armature, rest, worlds, roots, fps, opts):

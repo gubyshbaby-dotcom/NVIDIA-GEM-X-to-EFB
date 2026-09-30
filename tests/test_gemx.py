@@ -50,9 +50,11 @@ def params(frames=3, overrides=None, go=(0.0, 0.0, 0.0), transl=(0.0, 0.95, 0.0)
 
 
 def solve(opts=None, **kw):
+    """Arms by their angles (hands=0) unless told otherwise: most of these tests are about
+    the angle transfer and the hinge, which the hand placement would reshape."""
     go, bp, tr = params(**kw)
     motion = motion_from_params(go, bp, tr, fps=30.0)
-    doc, rep = retarget(motion, ARM, opts or RetargetOptions(smoothing=0.0))
+    doc, rep = retarget(motion, ARM, opts or RetargetOptions(smoothing=0.0, hands=0.0))
     rig = Rig(ARM, coord=False)
     table = pose_table_from_clip(rig, read_document(rig, doc, rep.fps_out))
     return doc, rep, table
@@ -248,11 +250,106 @@ class TestRetarget(unittest.TestCase):
                      for i in range(len(table.frames)) for leg in ("Leg_R", "Leg_L"))
         self.assertAlmostEqual(lowest, 0.0, delta=0.02)
 
+    def test_body_map_pulls_only_inside_the_shoulders(self):
+        from efb.gemx import _Solver
+        go, bp, tr = params()
+        body = _Solver(motion_from_params(go, bp, tr, 30.0), ARM, RetargetOptions()).body
+        self.assertAlmostEqual(body.biped, 0.375, places=3)
+        self.assertAlmostEqual(body.pull(body.human), 0.0)
+        self.assertAlmostEqual(body.pull(body.human + 0.2), 0.0)
+        self.assertAlmostEqual(body.pull(0.0), body.excess)
+        self.assertAlmostEqual(body.pull(-0.1), body.excess)
+        self.assertGreater(body.excess, 0.15)
+
+    def test_hands_keep_a_t_pose_straight(self):
+        _doc, _rep, t = solve(RetargetOptions(smoothing=0.0, hands=1.0))
+        for bone in ("Arm_R", "Hand_R"):
+            got = y_axis(t.world[bone][0])
+            self.assertLess(math.degrees(math.acos(min(1.0, got[0]))), 3.0)
+
+    def test_hands_follow_the_body(self):
+        """The person's right hand held across the chest, past the midline: copied angles
+        leave the biped's on its own side of the body, hand placement carries it over."""
+        pose = {"RightArm": (0.0, math.pi / 2, 0.0), "RightForeArm": (0.0, math.pi / 2, 0.0)}
+        grip = {}
+        for hands in (0.0, 1.0):
+            _doc, _rep, t = solve(RetargetOptions(smoothing=0.0, hands=hands),
+                                  overrides=pose)
+            chest = t.world["Chest"][0].inverse()
+            grip[hands] = chest.transform_point(t.world["Tool_R"][0].to_translation())
+        # The biped's arm (0.57 m) is shorter than the span between its arm roots (0.75 m),
+        # so it reaches over as far as it can rather than to the mapped point.
+        self.assertGreater(grip[0.0][0], 0.05)
+        self.assertLess(grip[1.0][0], -0.05)
+
     def test_not_a_biped(self):
         arm = bundled.armature("biped")
         arm.joints.pop("Tool_R")
         with self.assertRaises(SomaError):
             check_armature(arm)
+
+
+class TestVideoCamera(unittest.TestCase):
+    def test_camera_is_recovered_from_the_two_copies(self):
+        """A camera 4 m in front of the person, 1.5 m up, looking at their hips: the
+        camera-space copy of the body is built from it, and the recovered Blender camera
+        has to look at the biped's pelvis from the same distance, scaled to the rig."""
+        world = load_motion(FIXTURE, fps=30.0)
+        cam = (0.3, 1.5, 4.0)
+        look = Q.unit3(Q.sub3(world.hips[0], cam))
+        # world -> camera (OpenCV: x right, y down, z forward), looking along `look`
+        z = look
+        x = Q.unit3(Q.cross3((0.0, -1.0, 0.0), z))
+        y = Q.cross3(z, x)
+        r = Q.from_rows((x, y, z))
+        body = [[_rotvec(Q.mul(Q.conj(g[SK.parents[j]]), g[j])) for j in range(2, 78)]
+                for g in _full(world)]
+        inc = motion_from_params([_rotvec(Q.mul(r, g[1])) for g in _full(world)],
+                                 [[v for rv in row for v in rv] for row in body],
+                                 [Q.rotate(r, Q.sub3(h, cam)) for h in world.hips], 30.0)
+        wld = motion_from_params([_rotvec(g[1]) for g in _full(world)],
+                                 [[v for rv in row for v in rv] for row in body],
+                                 world.hips, 30.0)
+        _doc, rep = retarget(wld, ARM, RetargetOptions(smoothing=0.0), inc,
+                             (1000.0, 1000.0, 640.0, 360.0))
+        track = rep.camera
+        self.assertEqual((track.width, track.height), (1280, 720))
+        rig = Rig(ARM, coord=False)
+        table = pose_table_from_clip(rig, read_document(rig, _doc, rep.fps_out))
+        pelvis_h = Q.scale3(Q.add3(*[wld.positions(0, ("LeftLeg", "RightLeg"))[k]
+                                     for k in ("LeftLeg", "RightLeg")]), 0.5)
+        root = table.world["Root"][0].to_translation()
+        to_root = Q.sub3(root, track.location[0])
+        forward = Q.rotate(track.rotation[0], (0.0, 0.0, -1.0))
+        self.assertAlmostEqual(Q.norm3(to_root), rep.leg_scale * Q.norm3(Q.sub3(pelvis_h, cam)),
+                               places=3)
+        hips_dir = Q.unit3(Q.sub3(Q.add3(root, Q.rotate(Q.mul(
+            Q.from_axis_angle((0, 0, 1), math.radians(rep.turned_degrees)), SOMA_TO_EF),
+            Q.scale3(Q.sub3(wld.hips[0], pelvis_h), rep.leg_scale))), track.location[0]))
+        self.assertGreater(Q.dot3(forward, hips_dir), math.cos(math.radians(0.5)))
+
+
+def _full(motion):
+    """Every joint's G, the ones the loader skipped filled from their parents."""
+    out = []
+    for row in motion.rotations:
+        row = list(row)
+        for j in range(len(row)):
+            if row[j] is None:
+                row[j] = row[SK.parents[j]]
+        out.append(row)
+    return out
+
+
+def _rotvec(q):
+    q = Q.normalize(q)
+    if q[0] < 0.0:
+        q = tuple(-v for v in q)
+    s = math.sqrt(q[1] ** 2 + q[2] ** 2 + q[3] ** 2)
+    if s < 1e-12:
+        return (0.0, 0.0, 0.0)
+    ang = 2.0 * math.atan2(s, q[0])
+    return tuple(v / s * ang for v in q[1:])
 
 
 class TestKeyReduction(unittest.TestCase):
