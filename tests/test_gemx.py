@@ -365,19 +365,23 @@ class TestReachingArms(unittest.TestCase):
 
     CAM = (-4.0, 1.3, 0.2)
 
-    def film(self, arm, fore, incam=True):
-        go, bp, tr = params(frames=2, overrides={"RightArm": arm, "RightForeArm": fore})
-        world = motion_from_params(go, bp, tr, fps=30.0)
+    def shoot(self, bp, incam=True, **opts):
+        n = len(bp)
+        world = motion_from_params([[0.0] * 3] * n, bp, [[0.0, 0.95, 0.0]] * n, fps=30.0)
         cam = None
         if incam:
             z = Q.unit3(Q.sub3(world.hips[0], self.CAM))
             x = Q.unit3(Q.cross3((0.0, -1.0, 0.0), z))
             r = Q.from_rows((x, Q.cross3(z, x), z))
-            cam = motion_from_params([_rotvec(r)] * 2, bp,
+            cam = motion_from_params([_rotvec(r)] * n, bp,
                                      [Q.rotate(r, Q.sub3(h, self.CAM)) for h in world.hips],
                                      30.0)
-        doc, rep = retarget(world, ARM, RetargetOptions(hands=0.0), cam,
-                            (1000.0, 1000.0, 640.0, 360.0) if incam else None)
+        return retarget(world, ARM, RetargetOptions(hands=0.0, **opts), cam,
+                        (1000.0, 1000.0, 640.0, 360.0) if incam else None)
+
+    def film(self, arm, fore, incam=True):
+        _go, bp, _tr = params(frames=2, overrides={"RightArm": arm, "RightForeArm": fore})
+        doc, rep = self.shoot(bp, incam)
         rot = doc.track("Hand_R").keys[0].rot
         return abs(math.degrees(2 * math.atan2(rot[1], rot[0]))) - 6.31, rep
 
@@ -404,6 +408,33 @@ class TestReachingArms(unittest.TestCase):
         bend, rep = self.film((0.0, 0.0, math.pi / 2), (0.0, 0.0, -math.radians(50.0)))
         self.assertAlmostEqual(bend, 50.0, delta=0.1)
         self.assertEqual(rep.arms_straightened, 0)
+
+    def test_straightening_only_opens_the_hinge(self):
+        """Frame by frame the camera opens the elbow and nothing else: the upper arm, its
+        twist included, is the one it is with straightening off, and the forearm differs
+        from it only about the hinge. Turning the forearm onto the straighter direction
+        instead swung the limb's plane round as the arm straightened - near straight it is
+        any plane - and the hinge spun the arm about itself with it, 55-77 degrees in a
+        frame at a boxing clip's punches."""
+        up, fore = SK.index["RightArm"] - 2, SK.index["RightForeArm"] - 2
+        axis = Q.unit3((0.0, -1.0, 0.6))
+        bp = []
+        for f in range(14):
+            row = [0.0] * 228
+            row[3 * up:3 * up + 3] = [0.0, math.pi / 2, 0.0]
+            row[3 * fore:3 * fore + 3] = list(Q.scale3(axis, math.radians(95.0 - 6.0 * f)))
+            bp.append(row)
+        cam, rep = self.shoot(bp)
+        off, _ = self.shoot(bp, incam=False, extend=0.0)
+        self.assertGreater(rep.arms_straightened, 5)
+        opened = 0.0
+        for a, b in zip(cam.track("Arm_R").keys, off.track("Arm_R").keys):
+            self.assertLess(math.degrees(Q.angle(a.rot, b.rot)), 1e-4)
+        for a, b in zip(cam.track("Hand_R").keys, off.track("Hand_R").keys):
+            d = Q.mul(Q.conj(b.rot), a.rot)
+            self.assertLess(max(abs(d[2]), abs(d[3])), 1e-6)
+            opened = max(opened, math.degrees(Q.angle(a.rot, b.rot)))
+        self.assertGreater(opened, 20.0)
 
     def test_no_camera_copy_no_camera(self):
         # the fixture holds body_params_global alone; the search must not hand it back

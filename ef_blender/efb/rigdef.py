@@ -46,7 +46,7 @@ __all__ = ["RigBone", "RigConstraint", "RigDriver", "RigCollectionDriver", "Driv
 RIG_ID = "efb_biped"
 RIG_VERSION = 12
 
-ADDON_VERSION = "0.28.0"
+ADDON_VERSION = "0.28.1"
 
 CTRL = "CTRL-"
 FK = "FK-"

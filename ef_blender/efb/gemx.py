@@ -35,9 +35,10 @@ below HINGE_FADE degrees of bend and the copied twist stands.
 Reaching arms are straightened. A single camera reads depth worst of anything, and a
 punch shows it: the arm is straight in the video while the estimate tips the forearm
 towards or away from the lens, folding its length into the elbow. With GEM-X's camera-space
-copy of the body at hand, a raised arm's forearm keeps the direction it has on screen and
-takes the depth that bends it least (see _Solver._depth); then any bend left under
-EXTEND_BELOW degrees is opened further (see _extend).
+copy of the body at hand, a raised arm's elbow opens to the bend its forearm would have at
+the depth that bends it least, on-screen direction kept (see _Solver._depth); then any bend
+left under EXTEND_BELOW degrees is opened further (see _extend). Both only open the hinge:
+the plane it folds in, and so the arm's twist, stays the one the estimate gave.
 
 The Hips' track is scaled by leg length - the biped's legs are 0.761 m, a person's about
 0.93 - so stride and jump height fit the body that has to perform them, and the result is
@@ -620,19 +621,19 @@ class _Solver:
         for limb in LIMBS:
             g_up = self.g(frame, limb.upper_src[0], yaw)
             g_low = self.g(frame, limb.lower_src[0], yaw)
-            open_by = 0.0
+            keep, open_by = 1.0, 0.0
             if limb.tool and opts.extend > 0.0:
                 open_by = min(1.0, opts.extend) * self._reaching(frame, yaw, g_up, limb)
                 if open_by > 0.0 and self.cam is not None:
-                    g_low = self._depth(frame, yaw, limb, g_up, g_low, open_by)
+                    keep = self._depth(frame, yaw, limb, g_up, g_low, open_by)
             up = Q.normalize(Q.mul(g_up, Q.mul(self.align[limb.upper], rest.rot[limb.upper])))
             low = Q.normalize(Q.mul(g_low, Q.mul(self.align[limb.lower],
                                                  rest.rot[limb.lower])))
             if self.body is not None and limb.tool:
-                up, low = self._reach(frame, yaw, limb, out, up, low, g_low, open_by)
+                up, low = self._reach(frame, yaw, limb, out, up, low, g_low, keep, open_by)
             elif opts.hinge:
                 up, low = self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]),
-                                      open_by)
+                                      keep, open_by)
             out[limb.upper], out[limb.lower] = up, low
             if limb.tool and limb.tool in rest.rot:
                 if opts.tools:
@@ -661,7 +662,7 @@ class _Solver:
         return Q.rotate(Q.mul(yaw, SOMA_TO_EF), Q.rotate(Q.conj(to_cam), Q.unit3(seen)))
 
     def _depth(self, frame, yaw, limb, g_up, g_low, amount):
-        """Re-choose a reaching forearm's depth. Returns its new world rotation.
+        """How much of a reaching elbow's bend the video bears out, 0..1.
 
         What a video shows of a forearm is its direction across the frame; how far it tips
         towards or away from the lens is the estimate's guess, and at a punch's peak the
@@ -670,28 +671,37 @@ class _Solver:
         on-screen direction and the line of sight, and turned within it towards the
         direction there that is closest to the upper arm: the straightest arm the video
         allows. Only up to DEPTH_BEND degrees of bend - a guard is folded whatever the
-        depth - and only as far as the upper arm agrees on screen with the forearm."""
+        depth - and only as far as the upper arm agrees on screen with the forearm.
+
+        What comes back is the ratio of that bend to the estimate's, for the hinge to fold
+        by; the forearm is not turned onto the new direction. As the arm straightens, the
+        plane through the upper arm and the new direction swings round - near straight it
+        is any plane at all - and the hinge, which turns the upper arm to fold in the
+        limb's plane, would spin the arm about itself with it: 55-77 degrees in a frame at
+        a punch. The estimate's own plane is steady, so the arm keeps its twist."""
         u = Q.rotate(g_up, self.src_dir[limb.upper])
         v = Q.unit3(Q.rotate(g_low, self.src_dir[limb.lower]))
-        w = amount * (1.0 - _ramp(_degrees_between(u, v), *DEPTH_BEND))
-        if w <= 0.0:
-            return g_low
+        bend = _degrees_between(u, v)
+        w = amount * (1.0 - _ramp(bend, *DEPTH_BEND))
+        if w <= 0.0 or bend < 1e-3:
+            return 1.0
         r = self._ray(frame, yaw, limb.lower_src[0])
         flat = Q.sub3(v, Q.scale3(r, Q.dot3(v, r)))
         if Q.norm3(flat) < 1e-6:
-            return g_low
+            return 1.0
         p = Q.unit3(flat)
         along = Q.dot3(u, p) / max(1e-9, Q.norm3(u))
         w *= _ramp(along, 0.0, 0.5)
         if w <= 0.0:
-            return g_low
+            return 1.0
         best = Q.unit3(Q.add3(Q.scale3(p, Q.dot3(u, p)), Q.scale3(r, Q.dot3(u, r))))
         want = Q.unit3(Q.add3(Q.scale3(v, 1.0 - w), Q.scale3(best, w)), v)
-        if _degrees_between(v, want) > DEPTH_REPORT:
+        opened = min(bend, _degrees_between(u, want))
+        if bend - opened > DEPTH_REPORT:
             self.straightened += 1
-        return Q.normalize(Q.mul(Q.between(v, want), g_low))
+        return opened / bend
 
-    def _reach(self, frame, yaw, limb, out, up, low, g_low, open_by=0.0):
+    def _reach(self, frame, yaw, limb, out, up, low, g_low, keep=1.0, open_by=0.0):
         """Draw the hand in towards the midline by the body map and re-solve the arm onto
         it, keeping the person's swivel. Returns (upper, lower) world rotations.
 
@@ -715,7 +725,7 @@ class _Solver:
         if pull <= 1e-6:
             if opts.hinge:
                 return self._hinge(limb, up, Q.rotate(g_low, self.src_dir[limb.lower]),
-                                   open_by)
+                                   keep, open_by)
             return up, low
 
         shoulder = limb.upper.replace("Arm", "Shoulder")
@@ -745,13 +755,14 @@ class _Solver:
                                          Q.sub3(elbow, root)), up))
         want = Q.sub3(grip, elbow)
         if opts.hinge:
-            return self._hinge(limb, up, want, open_by)
+            return self._hinge(limb, up, want, keep, open_by)
         low = Q.normalize(Q.mul(Q.between(Q.rotate(low, (0.0, 1.0, 0.0)), want), low))
         return up, low
 
-    def _hinge(self, limb, up, want_low_dir, open_by=0.0):
+    def _hinge(self, limb, up, want_low_dir, keep=1.0, open_by=0.0):
         """Turn the upper bone about itself until the limb's bend lies in its hinge plane,
-        then fold the lower bone about the hinge alone - opened by _extend(open_by)."""
+        then fold the lower bone about the hinge alone - by `keep` of the bend, opened
+        further by _extend(open_by)."""
         rest = self.rest
         u = Q.rotate(up, (0.0, 1.0, 0.0))
         l = Q.unit3(want_low_dir)
@@ -772,7 +783,7 @@ class _Solver:
         err = math.degrees(math.acos(max(-1.0, min(1.0, Q.dot3(got, l)))))
         self.hinge_error = max(self.hinge_error, err)
         if open_by > 0.0:
-            reach = _extend(phi, open_by)
+            reach = _extend(phi * keep, open_by)
             if reach != phi:
                 fold = reach - self.rest_fold[limb.lower]
                 local = Q.mul(rest.local_rot[limb.lower],
